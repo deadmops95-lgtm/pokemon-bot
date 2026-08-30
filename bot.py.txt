@@ -18,7 +18,7 @@ except ImportError:
     keep_alive = None
 
 # ================= 1. ВСТАВЬТЕ СЮДА ВАШ ТОКЕН =================
-BOT_TOKEN = 8838508680:AAHguMr07zwQ7hbSUKjyaNDB7bXd1DTh8b0
+BOT_TOKEN = "8838508680:AAHguMr07zwQ7hbSUKjyaNDB7bXd1DTh8b0"
 
 ADMINS = ["prokudin95"]
 
