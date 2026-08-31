@@ -1,16 +1,18 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import random
 import sqlite3
 import time
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup,
-    CallbackQuery, InputMediaPhoto,
-    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    CallbackQuery, InputMediaPhoto, LabeledPrice, PreCheckoutQuery,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat, WebAppInfo
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
@@ -19,8 +21,11 @@ try:
 except ImportError:
     keep_alive = None
 
-# ================= 1. КОНФИГУРАЦИЯ И АДМИНИСТРАЦИЯ =================
+# ================= 1. КОНФИГУРАЦИЯ И СЕТЬ =================
 BOT_TOKEN = "8838508680:AAHguMr07zwQ7hbSUKjyaNDB7bXd1DTh8b0"
+# Вставьте сюда вашу ссылку на GitHub Pages (или оставьте для авто-кнопки):
+WEBAPP_URL = "https://prokudin95.github.io/pokemon-app/"
+PORT = int(os.environ.get("PORT", 8080))
 
 ADMIN_USERNAMES = ["prokudin95"]
 ADMIN_IDS = set()
@@ -35,190 +40,98 @@ def check_admin(user: types.User) -> bool:
         return True
     return False
 
-# Таймеры и лимиты
-COOLDOWN_HUNT_DEFAULT = 4 * 3600
-COOLDOWN_HUNT_VIP = 2 * 3600
-COOLDOWN_DAILY = 24 * 3600
-COOLDOWN_SPIN = 24 * 3600
-BREEDING_DURATION = 4 * 3600
-QUIZ_MAX_ATTEMPTS = 3
-QUIZ_RESET_INTERVAL = 24 * 3600
+# Баланс энергии и цен
+MAX_ENERGY = 100
+ENERGY_RECOVERY_SECONDS = 120  # 1 энергия раз в 2 минуты
 EVOLVE_COST_CANDIES = 3
+EVOLVE_COST_COINS = 150
 
-# Цены магазина
 SHOP_PRICES = {
-    "lure": 15,          # 1 Приманка
-    "ultraball": 25,     # 1 Ультрабол
-    "candies_3": 35,     # 3 Конфеты эволюции
-    "egg": 100,          # Эпическое Яйцо
-    "vip_7d": 250        # VIP на 7 дней
-}
-
-DAILY_STREAK_REWARDS = {
-    1: {"coins": 25, "candies": 1, "lures": 0, "ultraballs": 0, "egg": None},
-    2: {"coins": 40, "candies": 0, "lures": 1, "ultraballs": 0, "egg": None},
-    3: {"coins": 60, "candies": 2, "lures": 0, "ultraballs": 0, "egg": None},
-    4: {"coins": 80, "candies": 0, "lures": 0, "ultraballs": 1, "egg": None},
-    5: {"coins": 100, "candies": 3, "lures": 1, "ultraballs": 0, "egg": None},
-    6: {"coins": 150, "candies": 0, "lures": 0, "ultraballs": 2, "egg": None},
-    7: {"coins": 300, "candies": 5, "lures": 1, "ultraballs": 2, "egg": "Epic"}
+    "lure": 15,          # +100 Энергии
+    "ultraball": 25,     # 100% поимка
+    "candies_3": 35,     # 3 Конфеты
+    "egg_rare": 100,     # Редкое яйцо
+    "vip_7d": 250        # VIP 7 дней
 }
 
 CP_RANGES = {
-    "Common": (80, 480),
-    "Rare": (480, 1350),
-    "Epic": (1400, 2700),
-    "Legendary": (2850, 4300)
+    "Common": (100, 500),
+    "Uncommon": (500, 1100),
+    "Rare": (1100, 2100),
+    "Epic": (2100, 3400),
+    "Legendary": (3500, 5500)
 }
 
-# ================= 2. БАЗА ПОКЕМОНОВ 1-3 ПОКОЛЕНИЙ (386 ВИДОВ) =================
+# ================= 2. БАЗА 5 ПОКОЛЕНИЙ (649 ПОКЕМОНОВ) =================
 POKEMON_DB = {
     "Legendary": [
-        (144, "Артикуно"), (145, "Запдос"), (146, "Молтрес"), (150, "Мьюту"), (151, "Мью"),
-        (243, "Райко"), (244, "Энтей"), (245, "Суикун"), (249, "Лугия"), (250, "Хо-Ох"), (251, "Селеби"),
-        (377, "Реджирок"), (378, "Реджиайс"), (379, "Реджистил"), (380, "Латиас"), (381, "Латиос"),
-        (382, "Кайогр"), (383, "Граудон"), (384, "Райкваза"), (385, "Джирачи"), (386, "Деоксис")
+        # Gen 1-3
+        (144, "Артикуно", 1), (145, "Запдос", 1), (146, "Молтрес", 1), (150, "Мьюту", 1), (151, "Мью", 1),
+        (243, "Райко", 2), (244, "Энтей", 2), (245, "Суикун", 2), (249, "Лугия", 2), (250, "Хо-Ох", 2),
+        (382, "Кайогр", 3), (383, "Граудон", 3), (384, "Райкваза", 3), (386, "Деоксис", 3),
+        # Gen 4-5
+        (483, "Диалга", 4), (484, "Палкия", 4), (487, "Гиратина", 4), (493, "Аркеус", 4),
+        (643, "Реширам", 5), (644, "Зекром", 5), (646, "Кюрем", 5)
     ],
     "Epic": [
-        (3, "Венузавр"), (6, "Чаризард"), (9, "Бластойз"), (65, "Алаказам"), (68, "Мачамп"),
-        (94, "Генгар"), (130, "Гьярадос"), (143, "Снорлакс"), (148, "Драгонаир"), (149, "Драгонайт"),
-        (154, "Меганиум"), (157, "Тайфложн"), (160, "Фералигатр"), (181, "Амфарос"), (212, "Скизор"),
-        (214, "Геракросс"), (229, "Хондум"), (230, "Кингдра"), (242, "Блисси"), (248, "Тиранитар"),
-        (254, "Септиль"), (257, "Блейзикен"), (260, "Свамперт"), (282, "Гардевуар"), (289, "Слакинг"),
-        (306, "Аггрон"), (330, "Флайгон"), (350, "Милотик"), (359, "Абсол"), (373, "Саламенс"), (376, "Метагросс")
+        (3, "Венузавр", 1), (6, "Чаризард", 1), (9, "Бластойз", 1), (94, "Генгар", 1), (149, "Драгонайт", 1),
+        (160, "Фералигатр", 2), (212, "Скизор", 2), (248, "Тиранитар", 2),
+        (254, "Септиль", 3), (257, "Блейзикен", 3), (260, "Свамперт", 3), (373, "Саламенс", 3), (376, "Метагросс", 3),
+        (448, "Лукарио", 4), (445, "Гарчомп", 4), (475, "Галлейд", 4),
+        (571, "Зороарк", 5), (635, "Хайдрейгон", 5), (637, "Волкарона", 5)
     ],
     "Rare": [
-        (1, "Бульбазавр"), (2, "Ивизавр"), (4, "Чармандер"), (5, "Чармелеон"), (7, "Сквиртл"), (8, "Вартортл"),
-        (12, "Баттерфри"), (18, "Пиджеот"), (25, "Пикачу"), (26, "Райчу"), (31, "Нидоквин"), (34, "Нидокинг"),
-        (38, "Найнтейлс"), (59, "Арканайн"), (64, "Кадабра"), (67, "Мачок"), (93, "Хонтер"), (95, "Оникс"),
-        (103, "Экзеггутор"), (105, "Маровак"), (106, "Хитмонли"), (107, "Хитмончан"), (112, "Райдон"),
-        (123, "Сайтер"), (125, "Электабазз"), (126, "Магмар"), (131, "Лапрас"), (133, "Иви"), (134, "Вапореон"),
-        (135, "Джолтеон"), (136, "Флареон"), (142, "Аэродактиль"), (147, "Дратини"),
-        (152, "Чикорита"), (153, "Бейлиф"), (155, "Синдаквил"), (156, "Квилава"), (158, "Тотодайл"), (159, "Кроконав"),
-        (169, "Кробат"), (175, "Тогепи"), (176, "Тогетик"), (184, "Азумарилл"), (185, "Судовудо"), (196, "Эспеон"),
-        (197, "Умбреон"), (208, "Стиликс"), (215, "Снизел"), (217, "Урсаринг"), (227, "Скармори"), (232, "Донфан"),
-        (246, "Ларвитар"), (247, "Пупитар"),
-        (252, "Трико"), (253, "Гровайл"), (255, "Торчик"), (256, "Комбаскен"), (258, "Мадкип"), (259, "Марштомп"),
-        (280, "Ральтс"), (281, "Кирлия"), (286, "Брелум"), (304, "Арон"), (305, "Лайрон"), (310, "Манэктрик"),
-        (319, "Шарпедо"), (321, "Вейлорд"), (323, "Камерапт"), (334, "Алтария"), (335, "Зангус"), (336, "Севипер"),
-        (344, "Клейдол"), (348, "Армалдо"), (371, "Багон"), (372, "Шелгон"), (374, "Белдум"), (375, "Метанг")
+        (25, "Пикачу", 1), (26, "Райчу", 1), (59, "Арканайн", 1), (131, "Лапрас", 1), (133, "Иви", 1),
+        (169, "Кробат", 2), (181, "Амфарос", 2), (196, "Эспеон", 2), (197, "Умбреон", 2),
+        (282, "Гардевуар", 3), (330, "Флайгон", 3), (350, "Милотик", 3), (359, "Абсол", 3),
+        (405, "Люксрэй", 4), (468, "Тогекисс", 4), (470, "Лифеон", 4), (471, "Гласеон", 4),
+        (530, "Экскадрил", 5), (553, "Крукодайл", 5), (609, "Шанделюр", 5)
+    ],
+    "Uncommon": [
+        (2, "Ивизавр", 1), (5, "Чармелеон", 1), (8, "Вартортл", 1), (18, "Пиджеот", 1),
+        (153, "Бейлиф", 2), (156, "Квилава", 2), (159, "Кроконав", 2),
+        (253, "Гровайл", 3), (256, "Комбаскен", 3), (259, "Марштомп", 3),
+        (388, "Гротл", 4), (391, "Монферно", 4), (394, "Принплап", 4),
+        (496, "Сервайн", 5), (499, "Пигнайт", 5), (502, "Дьювотт", 5)
     ],
     "Common": [
-        (10, "Катерпи"), (11, "Метапод"), (13, "Видл"), (14, "Какуна"), (16, "Пиджи"), (19, "Раттата"),
-        (21, "Спироу"), (23, "Эканс"), (27, "Сэндшрю"), (29, "Нидоран♀"), (32, "Нидоран♂"), (35, "Клефейри"),
-        (37, "Вульпикс"), (39, "Джиглипуф"), (41, "Зубат"), (43, "Оддиш"), (46, "Парас"), (48, "Венонат"),
-        (50, "Диглетт"), (52, "Мяут"), (54, "Псайдак"), (56, "Манки"), (58, "Гроулит"), (60, "Поливаг"),
-        (63, "Абра"), (66, "Мачоп"), (69, "Беллспраут"), (72, "Тентакул"), (74, "Геодуд"), (77, "Понита"),
-        (79, "Слоупок"), (81, "Магнемайт"), (84, "Додуо"), (86, "Сил"), (88, "Граймер"), (90, "Шеллдер"),
-        (92, "Гастли"), (96, "Дроузи"), (98, "Крабби"), (100, "Волторб"), (104, "Кьюбон"), (109, "Коффинг"),
-        (111, "Райхорн"), (116, "Хорси"), (118, "Голдин"), (120, "Старью"), (129, "Мэджикарп"),
-        (161, "Сентрет"), (162, "Фурет"), (163, "Хухут"), (165, "Ледиба"), (167, "Спинарак"), (170, "Чинчоу"),
-        (172, "Пичу"), (177, "Нату"), (179, "Марип"), (183, "Марилл"), (187, "Хоппип"), (190, "Айпом"),
-        (191, "Санкерн"), (193, "Янма"), (194, "Вупер"), (198, "Маркроу"), (200, "Мисдривус"), (202, "Воббаффет"),
-        (204, "Пайнко"), (206, "Данспарс"), (207, "Глайгар"), (209, "Снаббулл"), (211, "Квилфиш"), (213, "Шакл"),
-        (216, "Теддиурса"), (218, "Слигма"), (220, "Свинаб"), (222, "Корсола"), (223, "Реморейд"), (225, "Делиберд"),
-        (228, "Хондур"), (231, "Фанпи"), (235, "Смигл"), (241, "Милтанк"),
-        (261, "Пучиена"), (263, "Зигзагун"), (265, "Вурмпл"), (270, "Лотад"), (273, "Сидот"), (276, "Тейллоу"),
-        (278, "Вингулл"), (283, "Сурскит"), (285, "Шрумиш"), (287, "Слакот"), (290, "Нинкада"), (293, "Уисмур"),
-        (296, "Макухита"), (298, "Азурилл"), (300, "Скитти"), (302, "Сэйблай"), (303, "Мавайл"), (307, "Медитайт"),
-        (309, "Электрайк"), (311, "Плюсл"), (312, "Минун"), (315, "Розелия"), (316, "Галпин"), (318, "Карванья"),
-        (320, "Вейлмер"), (322, "Нумел"), (324, "Торкоал"), (325, "Спуинк"), (327, "Спинда"), (328, "Трапинч"),
-        (331, "Кактус"), (333, "Сваблу"), (337, "Лунатон"), (338, "Солрок"), (339, "Барбоч"), (341, "Корфиш"),
-        (343, "Балтой"), (349, "Фибас"), (351, "Кастформ"), (352, "Кеклеон"), (353, "Шаппет"), (355, "Даскалл"),
-        (361, "Снорант"), (363, "Сфил"), (366, "Кламперл"), (370, "Лавдиск")
+        (1, "Бульбазавр", 1), (4, "Чармандер", 1), (7, "Сквиртл", 1), (10, "Катерпи", 1), (16, "Пиджи", 1), (19, "Раттата", 1),
+        (152, "Чикорита", 2), (155, "Синдаквил", 2), (158, "Тотодайл", 2), (161, "Сентрет", 2),
+        (252, "Трико", 3), (255, "Торчик", 3), (258, "Мадкип", 3), (261, "Пучиена", 3),
+        (387, "Туртвиг", 4), (390, "Чимчар", 4), (393, "Пиплап", 4), (396, "Старли", 4), (403, "Шинкс", 4),
+        (495, "Снайви", 5), (498, "Тепиг", 5), (501, "Ошавотт", 5), (504, "Патрат", 5), (509, "Пуррлойн", 5)
     ]
 }
 
-RARITY_NAMES = {
-    "Common": "⚪️ Обычный", "Rare": "🔵 Редкий",
-    "Epic": "🟣 Эпический", "Legendary": "🟡 Легендарный"
+POKEMON_TYPES = {
+    1: "🌿 Трава", 2: "🌿 Трава", 3: "🌿 Трава", 4: "🔥 Огонь", 5: "🔥 Огонь", 6: "🔥 Огонь",
+    7: "💧 Вода", 8: "💧 Вода", 9: "💧 Вода", 25: "⚡️ Электро", 26: "⚡️ Электро", 94: "👻 Призрак",
+    131: "💧 Вода", 133: "⚪️ Обычный", 144: "❄️ Лед", 145: "⚡️ Электро", 146: "🔥 Огонь",
+    149: "🐲 Дракон", 150: "🔮 Психик", 151: "🔮 Психик", 152: "🌿 Трава", 155: "🔥 Огонь",
+    158: "💧 Вода", 160: "💧 Вода", 212: "⚙️ Сталь", 248: "🪨 Камень", 249: "🔮 Психик", 250: "🔥 Огонь",
+    252: "🌿 Трава", 254: "🌿 Трава", 255: "🔥 Огонь", 257: "🔥 Огонь", 258: "💧 Вода", 260: "💧 Вода",
+    373: "🐲 Дракон", 376: "⚙️ Сталь", 382: "💧 Вода", 383: "🏜 Земля", 384: "🐲 Дракон",
+    387: "🌿 Трава", 390: "🔥 Огонь", 393: "💧 Вода", 448: "🥋 Боевой", 493: "⚪️ Обычный",
+    495: "🌿 Трава", 498: "🔥 Огонь", 501: "💧 Вода", 571: "🌑 Темный", 643: "🐲 Дракон"
 }
-COIN_REWARDS = {"Common": 2, "Rare": 5, "Epic": 15, "Legendary": 40}
 
 EVOLUTIONS = {
-    1: 2, 2: 3, 4: 5, 5: 6, 7: 8, 8: 9, 10: 11, 11: 12, 13: 14, 14: 15,
-    16: 17, 17: 18, 19: 20, 21: 22, 23: 24, 25: 26, 27: 28, 29: 30, 30: 31,
-    32: 33, 33: 34, 35: 36, 37: 38, 39: 40, 41: 42, 43: 44, 44: 45, 46: 47,
-    48: 49, 50: 51, 52: 53, 54: 55, 56: 57, 58: 59, 60: 61, 61: 62, 63: 64,
-    64: 65, 66: 67, 67: 68, 69: 70, 70: 71, 72: 73, 74: 75, 75: 76, 77: 78,
-    79: 80, 81: 82, 84: 85, 86: 87, 88: 89, 90: 91, 92: 93, 93: 94, 96: 97,
-    98: 99, 100: 101, 102: 103, 104: 105, 109: 110, 111: 112, 116: 117,
-    118: 119, 120: 121, 129: 130, 133: 134, 138: 139, 140: 141, 147: 148, 148: 149,
-    152: 153, 153: 154, 155: 156, 156: 157, 158: 159, 159: 160, 161: 162,
-    163: 164, 165: 166, 167: 168, 170: 171, 172: 25, 175: 176, 177: 178,
-    179: 180, 180: 181, 183: 184, 187: 188, 188: 189, 191: 192, 194: 195,
-    204: 205, 216: 217, 218: 219, 220: 221, 223: 224, 228: 229, 231: 232,
-    246: 247, 247: 248,
-    252: 253, 253: 254, 255: 256, 256: 257, 258: 259, 259: 260, 261: 262,
-    263: 264, 265: 266, 270: 271, 271: 272, 273: 274, 274: 275, 276: 277,
-    278: 279, 280: 281, 281: 282, 285: 286, 287: 288, 288: 289, 293: 294,
-    294: 295, 296: 297, 304: 305, 305: 306, 309: 310, 316: 317, 318: 319,
-    320: 321, 322: 323, 328: 329, 329: 330, 339: 340, 341: 342, 343: 344,
-    349: 350, 353: 354, 355: 356, 361: 362, 363: 364, 364: 365, 371: 372,
-    372: 373, 374: 375, 375: 376
-}
-
-POKEMON_TYPES = {}
-for pid in [1,2,3,43,44,45,69,70,71,102,103,114,152,153,154,182,187,188,189,191,192,251,252,253,254,270,271,272,273,274,275,285,286,315,331,332,345,346,357]: POKEMON_TYPES[pid] = "🌿 Трава"
-for pid in [4,5,6,37,38,58,59,77,78,126,136,146,155,156,157,218,219,228,229,240,244,250,255,256,257,322,323,324]: POKEMON_TYPES[pid] = "🔥 Огонь"
-for pid in [7,8,9,54,55,60,61,62,72,73,79,80,86,87,90,91,98,99,116,117,118,119,120,121,129,130,131,134,158,159,160,170,171,183,184,186,194,195,211,222,223,224,226,230,245,249,258,259,260,278,279,283,318,319,320,321,339,340,341,342,349,350,363,364,365,366,367,368,369,370,382]: POKEMON_TYPES[pid] = "💧 Вода"
-for pid in [25,26,81,82,100,101,125,135,145,172,179,180,181,239,243,309,310,311,312]: POKEMON_TYPES[pid] = "⚡️ Электро"
-for pid in [63,64,65,96,97,122,150,151,177,178,196,199,201,202,203,280,281,282,325,326,358,360,380,381,385,386]: POKEMON_TYPES[pid] = "🔮 Психик"
-for pid in [56,57,66,67,68,106,107,214,236,237,296,297,307,308]: POKEMON_TYPES[pid] = "🥋 Боевой"
-for pid in [74,75,76,95,138,139,140,141,142,185,246,247,248,299,304,305,306,337,338,347,348,377]: POKEMON_TYPES[pid] = "🪨 Камень"
-for pid in [27,28,31,34,50,51,104,105,111,112,207,220,221,231,232,328,329,330,343,344,383]: POKEMON_TYPES[pid] = "🏜 Земля"
-for pid in [92,93,94,200,292,302,353,354,355,356]: POKEMON_TYPES[pid] = "👻 Призрак"
-for pid in [147,148,149,334,371,372,373,384]: POKEMON_TYPES[pid] = "🐲 Дракон"
-for pid in [124,144,225,238,361,362,378]: POKEMON_TYPES[pid] = "❄️ Лед"
-for pid in [10,11,12,13,14,15,46,47,48,49,123,127,165,166,167,168,193,204,205,213,265,266,267,268,269,284,290,291,313,314]: POKEMON_TYPES[pid] = "🐛 Насекомое"
-for pid in [23,24,29,30,32,33,41,42,88,89,109,110,169,316,317,336]: POKEMON_TYPES[pid] = "☠️ Яд"
-for pid in [197,198,215,229,261,262,359]: POKEMON_TYPES[pid] = "🌑 Темный"
-for pid in [208,212,227,303,374,375,376,379]: POKEMON_TYPES[pid] = "⚙️ Сталь"
-
-TYPE_ADVANTAGE = {
-    "🔥 Огонь": ["🌿 Трава", "🐛 Насекомое", "❄️ Лед", "⚙️ Сталь"],
-    "💧 Вода": ["🔥 Огонь", "🏜 Земля", "🪨 Камень"],
-    "🌿 Трава": ["💧 Вода", "🏜 Земля", "🪨 Камень"],
-    "⚡️ Электро": ["💧 Вода"],
-    "🏜 Земля": ["⚡️ Электро", "🔥 Огонь", "☠️ Яд", "🪨 Камень", "⚙️ Сталь"],
-    "🥋 Боевой": ["⚪️ Обычный", "🪨 Камень", "❄️ Лед", "🌑 Темный", "⚙️ Сталь"],
-    "🔮 Психик": ["🥋 Боевой", "☠️ Яд"],
-    "👻 Призрак": ["🔮 Психик", "👻 Призрак"],
-    "🌑 Темный": ["🔮 Психик", "👻 Призрак"],
-    "⚙️ Сталь": ["❄️ Лед", "🪨 Камень"]
-}
-
-SKILLS = {
-    "🔥 Огонь": ["Огнемёт", "Огненный вихрь", "Удар пламени"],
-    "💧 Вода": ["Водомёт", "Гидропомпа", "Водный импульс"],
-    "🌿 Трава": ["Листопад", "Солнечный луч", "Семя-пиявка"],
-    "⚡️ Электро": ["Удар молнии", "Вольт-удар", "Искры"],
-    "🔮 Психик": ["Психокинез", "Ментальный луч", "Пси-удар"],
-    "🥋 Боевой": ["Близкий бой", "Каратэ-удар", "Сейсмический бросок"],
-    "🪨 Камень": ["Камнепад", "Каменное лезвие", "Каменный бросок"],
-    "🏜 Земля": ["Землетрясение", "Грязевая бомба", "Песчаная буря"],
-    "👻 Призрак": ["Теневой шар", "Ночной кошмар", "Теневой коготь"],
-    "🐲 Дракон": ["Дыхание дракона", "Коготь дракона", "Драконий пульс"],
-    "❄️ Лед": ["Ледяной луч", "Вьюга", "Ледяной клык"],
-    "🐛 Насекомое": ["Укус жука", "Сигнал луч", "Икс-ножницы"],
-    "☠️ Яд": ["Ядовитый укол", "Грязевой залп", "Кислота"],
-    "🌑 Темный": ["Темный импульс", "Ночной удар", "Хруст"],
-    "⚙️ Сталь": ["Стальное крыло", "Железная голова", "Метеорный кулак"],
-    "⚪️ Обычный": ["Быстрая атака", "Таран", "Мега-удар"]
+    1: 2, 2: 3, 4: 5, 5: 6, 7: 8, 8: 9, 25: 26,
+    152: 153, 153: 154, 155: 156, 156: 157, 158: 159, 159: 160,
+    252: 253, 253: 254, 255: 256, 256: 257, 258: 259, 259: 260,
+    387: 388, 388: 389, 390: 391, 391: 392, 393: 394, 394: 395,
+    495: 496, 496: 497, 498: 499, 499: 500, 501: 502, 502: 503
 }
 
 ALL_POKEMON_MAP = {}
 for r, p_list in POKEMON_DB.items():
-    for pid, name in p_list:
-        ALL_POKEMON_MAP[pid] = {"name": name, "rarity": r}
-        ALL_POKEMON_MAP[name.lower()] = {"id": pid, "name": name, "rarity": r}
-
-def get_pokemon_image_url(pokemon_id: int, is_shiny: bool) -> str:
-    shiny_path = "shiny/" if is_shiny else ""
-    return f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/{shiny_path}{pokemon_id}.png"
+    for item in p_list:
+        pid, name, gen = item[0], item[1], item[2]
+        ALL_POKEMON_MAP[pid] = {"name": name, "rarity": r, "gen": gen}
+        ALL_POKEMON_MAP[name.lower()] = {"id": pid, "name": name, "rarity": r, "gen": gen}
 
 def generate_cp(rarity: str, is_shiny: bool, is_shadow: bool = False) -> int:
-    min_cp, max_cp = CP_RANGES[rarity]
+    min_cp, max_cp = CP_RANGES.get(rarity, (100, 500))
     cp = random.randint(min_cp, max_cp)
     if is_shiny: cp = int(cp * 1.15)
     if is_shadow: cp = int(cp * 1.20)
@@ -238,25 +151,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            coins INTEGER DEFAULT 50,
-            candies INTEGER DEFAULT 2,
-            last_hunt REAL DEFAULT 0,
-            lures INTEGER DEFAULT 0,
-            ultraballs INTEGER DEFAULT 0,
-            potions INTEGER DEFAULT 2,
+            coins INTEGER DEFAULT 500,
+            candies INTEGER DEFAULT 10,
+            energy INTEGER DEFAULT 100,
+            last_energy_calc REAL DEFAULT 0,
+            lures INTEGER DEFAULT 1,
+            ultraballs INTEGER DEFAULT 2,
+            potions INTEGER DEFAULT 3,
+            egg_type TEXT DEFAULT NULL,
+            egg_hatch_time REAL DEFAULT 0,
+            vip_until REAL DEFAULT 0,
             last_daily REAL DEFAULT 0,
             daily_streak INTEGER DEFAULT 0,
-            egg_rarity TEXT DEFAULT NULL,
-            egg_hatch_time REAL DEFAULT 0,
-            referred_by INTEGER DEFAULT 0,
-            vip_until REAL DEFAULT 0,
-            expedition_tier INTEGER DEFAULT 0,
-            expedition_end REAL DEFAULT 0,
-            quiz_attempts INTEGER DEFAULT 3,
-            quiz_reset_time REAL DEFAULT 0,
-            last_spin REAL DEFAULT 0,
-            breeding_end REAL DEFAULT 0,
-            breeding_ready INTEGER DEFAULT 0
+            referred_by INTEGER DEFAULT 0
         );
     """)
     cur.execute("""
@@ -265,12 +172,12 @@ def init_db():
             user_id INTEGER,
             pokemon_id INTEGER,
             pokemon_name TEXT,
+            gen INTEGER DEFAULT 1,
             rarity TEXT,
             is_shiny INTEGER DEFAULT 0,
             is_shadow INTEGER DEFAULT 0,
             is_purified INTEGER DEFAULT 0,
-            cp INTEGER DEFAULT 100,
-            UNIQUE(user_id, pokemon_name, is_shiny, is_shadow)
+            cp INTEGER DEFAULT 100
         );
     """)
     cur.execute("""
@@ -279,7 +186,7 @@ def init_db():
             name TEXT,
             req_cp INTEGER,
             champ_id INTEGER DEFAULT 0,
-            champ_name TEXT DEFAULT 'Страж NPC',
+            champ_name TEXT DEFAULT 'Страж Лиги',
             p_name TEXT,
             p_id INTEGER,
             p_cp INTEGER,
@@ -287,42 +194,18 @@ def init_db():
             last_payout REAL DEFAULT 0
         );
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS market (
-            lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller_id INTEGER,
-            seller_name TEXT,
-            pokemon_id INTEGER,
-            pokemon_name TEXT,
-            rarity TEXT,
-            is_shiny INTEGER,
-            is_shadow INTEGER,
-            cp INTEGER,
-            price INTEGER
-        );
-    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inv_uid ON inventory(user_id);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_towers_id ON towers(tower_id);")
     conn.commit()
 
-    cols = [
-        ("potions", "INTEGER DEFAULT 2"), ("daily_streak", "INTEGER DEFAULT 0"),
-        ("expedition_tier", "INTEGER DEFAULT 0"), ("expedition_end", "REAL DEFAULT 0"),
-        ("quiz_attempts", "INTEGER DEFAULT 3"), ("quiz_reset_time", "REAL DEFAULT 0"),
-        ("last_spin", "REAL DEFAULT 0"), ("breeding_end", "REAL DEFAULT 0"),
-        ("breeding_ready", "INTEGER DEFAULT 0"), ("vip_until", "REAL DEFAULT 0")
-    ]
-    for c_name, c_type in cols:
-        try:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {c_name} {c_type}")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
-
+    # Инициализация 7 Башен
     towers_init = [
-        (1, "🥉 Башня Канто", 500, "Геодуд", 74, 550, 10),
-        (2, "🥈 Башня Джото", 1500, "Скизор", 212, 1650, 25),
-        (3, "🥇 Башня Хоэнна", 2800, "Райкваза", 384, 3200, 50)
+        (1, "🥉 Башня Канто", 500, "Геодуд", 74, 550, 15),
+        (2, "🥈 Башня Джото", 1200, "Скизор", 212, 1350, 25),
+        (3, "🥇 Башня Хоэнна", 2200, "Саламенс", 373, 2400, 45),
+        (4, "💠 Башня Синно", 3100, "Лукарио", 448, 3300, 70),
+        (5, "👑 Башня Юновы", 4000, "Зороарк", 571, 4200, 100),
+        (6, "☠️ Башня Теней", 4600, "Теневой Мьюту", 150, 4800, 130),
+        (7, "🌌 Башня Создателя", 5200, "Аркеус", 493, 5500, 200)
     ]
     for tid, tname, req_cp, pname, pid, pcp, rate in towers_init:
         cur.execute("""
@@ -338,11 +221,13 @@ def get_user_data(user_id: int, username: str = ""):
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     u = cur.fetchone()
+    now = time.time()
+    
     if not u:
         cur.execute("""
-            INSERT INTO users (user_id, username, coins, candies, potions, quiz_attempts)
-            VALUES (?, ?, 50, 2, 2, 3)
-        """, (user_id, username))
+            INSERT INTO users (user_id, username, coins, candies, energy, last_energy_calc)
+            VALUES (?, ?, 500, 10, 100, ?)
+        """, (user_id, username, now))
         conn.commit()
         cur.close()
         conn.close()
@@ -350,10 +235,19 @@ def get_user_data(user_id: int, username: str = ""):
 
     col_names = [desc[0] for desc in cur.description]
     user_dict = dict(zip(col_names, u))
-    if username and user_dict.get("username") != username:
-        cur.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
-        conn.commit()
-        user_dict["username"] = username
+
+    # Восстановление энергии со временем
+    last_calc = user_dict.get("last_energy_calc", now)
+    current_energy = user_dict.get("energy", 100)
+    if current_energy < MAX_ENERGY:
+        recovered = int((now - last_calc) / ENERGY_RECOVERY_SECONDS)
+        if recovered > 0:
+            new_energy = min(MAX_ENERGY, current_energy + recovered)
+            cur.execute("UPDATE users SET energy = ?, last_energy_calc = ? WHERE user_id = ?", (new_energy, now, user_id))
+            conn.commit()
+            user_dict["energy"] = new_energy
+            user_dict["last_energy_calc"] = now
+
     cur.close()
     conn.close()
     return user_dict
@@ -383,48 +277,13 @@ def change_candies(user_id: int, delta: int):
     cur.close()
     conn.close()
 
-def save_pokemon(user_id: int, pid: int, name: str, rarity: str, shiny: int, shadow: int, purified: int, cp: int) -> bool:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM inventory WHERE user_id = ? AND pokemon_name = ? AND is_shiny = ? AND is_shadow = ?", (user_id, name, shiny, shadow))
-    if cur.fetchone():
-        cur.close()
-        conn.close()
-        return False
-    cur.execute("""
-        INSERT INTO inventory (user_id, pokemon_id, pokemon_name, rarity, is_shiny, is_shadow, is_purified, cp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, pid, name, rarity, shiny, shadow, purified, cp))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return True
-
-def admin_force_save_pokemon(user_id: int, pid: int, name: str, rarity: str, shiny: int, shadow: int, purified: int, cp: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, cp FROM inventory WHERE user_id = ? AND pokemon_name = ? AND is_shiny = ? AND is_shadow = ?", (user_id, name, shiny, shadow))
-    row = cur.fetchone()
-    if row:
-        new_cp = max(row[1], cp)
-        cur.execute("UPDATE inventory SET cp = ? WHERE id = ?", (new_cp, row[0]))
-    else:
-        cur.execute("""
-            INSERT INTO inventory (user_id, pokemon_id, pokemon_name, rarity, is_shiny, is_shadow, is_purified, cp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, pid, name, rarity, shiny, shadow, purified, cp))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def replace_pokemon_evolution(inv_id: int, user_id: int, new_pid: int, new_name: str, new_rarity: str, new_cp: int):
+def save_pokemon(user_id: int, pid: int, name: str, gen: int, rarity: str, shiny: int, shadow: int, purified: int, cp: int):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE inventory
-        SET pokemon_id = ?, pokemon_name = ?, rarity = ?, cp = ?
-        WHERE id = ? AND user_id = ?
-    """, (new_pid, new_name, new_rarity, new_cp, inv_id, user_id))
+        INSERT INTO inventory (user_id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, pid, name, gen, rarity, shiny, shadow, purified, cp))
     conn.commit()
     cur.close()
     conn.close()
@@ -432,1178 +291,233 @@ def replace_pokemon_evolution(inv_id: int, user_id: int, new_pid: int, new_name:
 def get_inventory(user_id: int):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, pokemon_id, pokemon_name, rarity, is_shiny, is_shadow, is_purified, cp FROM inventory WHERE user_id = ? ORDER BY cp DESC", (user_id,))
+    cur.execute("SELECT id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp FROM inventory WHERE user_id = ? ORDER BY cp DESC", (user_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
     return rows
 
-# ================= 4. АВТОМАТИЧЕСКИЙ АНИМИРОВАННЫЙ БОЙ 2.0 =================
-def build_hp_bar(current_hp: int, max_hp: int) -> str:
-    pct = max(0.0, min(1.0, current_hp / max_hp))
-    filled = int(round(pct * 8))
-    empty = 8 - filled
-    return "🟩" * filled + "⬜️" * empty
+# ================= 4. AIOHTTP REST API СЕРВЕР =================
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response(status=200)
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
-async def run_animated_battle(target_msg: types.Message, p1_data: dict, p2_data: dict, battle_type: str, metadata: dict = None):
-    p1_max_hp = max(100, int(p1_data["cp"] * 0.45))
-    p2_max_hp = max(100, int(p2_data["cp"] * 0.45))
-    
-    p1_hp = p1_max_hp
-    p2_hp = p2_max_hp
-    
-    p1_type = POKEMON_TYPES.get(p1_data["poke_id"], "⚪️ Обычный")
-    p2_type = POKEMON_TYPES.get(p2_data["poke_id"], "⚪️ Обычный")
-    
-    round_num = 1
-    log_text = "🔥 <b>Бой начался!</b> Покемоны вышли на арену!"
+async def api_options_handler(request):
+    return web.Response(status=200)
 
-    # Стартовый кадр
-    p1_bar = build_hp_bar(p1_hp, p1_max_hp)
-    p2_bar = build_hp_bar(p2_hp, p2_max_hp)
-    start_text = (
-        f"⚔️ <b>АРЕНА БИТВЫ (Раунд {round_num})</b>\n\n"
-        f"🔴 <b>{html.escape(str(p1_data['name']))}</b>: {html.escape(str(p1_data['poke_name']))} ({p1_type})\n"
-        f"❤️ [{p1_bar}] {p1_hp}/{p1_max_hp} HP\n\n"
-        f"VS\n\n"
-        f"🔵 <b>{html.escape(str(p2_data['name']))}</b>: {html.escape(str(p2_data['poke_name']))} ({p2_type})\n"
-        f"❤️ [{p2_bar}] {p2_hp}/{p2_max_hp} HP\n\n"
-        f"📜 <i>{log_text}</i>"
-    )
+async def api_get_user_handler(request):
     try:
-        await target_msg.edit_text(start_text, parse_mode="HTML")
-    except Exception:
-        target_msg = await target_msg.answer(start_text, parse_mode="HTML")
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        username = data.get("username", "")
+        if not uid:
+            return web.json_response({"status": "error", "message": "Missing user_id"})
 
-    await asyncio.sleep(1.2)
+        u = get_user_data(uid, username)
+        inv = get_inventory(uid)
 
-    # Цикл боя (до 6 раундов)
-    while p1_hp > 0 and p2_hp > 0 and round_num <= 6:
-        round_num += 1
-        round_logs = []
+        pokes_list = []
+        for r in inv:
+            pokes_list.append({
+                "inv_id": r[0], "id": r[1], "name": r[2], "gen": r[3],
+                "rarity": r[4], "is_shiny": bool(r[5]), "is_shadow": bool(r[6]),
+                "type": POKEMON_TYPES.get(r[1], "⚪️ Обычный"), "cp": r[8]
+            })
 
-        # Ход Игрока 1
-        p1_skills = SKILLS.get(p1_type, ["Атака"])
-        p1_skill = random.choice(p1_skills)
-        mult1 = 1.4 if p2_type in TYPE_ADVANTAGE.get(p1_type, []) else 1.0
-        dmg1 = int(random.randint(25, 42) * mult1)
-        is_crit1 = random.random() < 0.20
-        if is_crit1: dmg1 = int(dmg1 * 1.5)
-        p2_hp = max(0, p2_hp - dmg1)
+        return web.json_response({
+            "status": "ok",
+            "user": {
+                "id": u["user_id"],
+                "username": u["username"],
+                "coins": u["coins"],
+                "candies": u["candies"],
+                "energy": u["energy"],
+                "lures": u["lures"],
+                "ultraballs": u["ultraballs"],
+                "vip": time.time() < u.get("vip_until", 0),
+                "egg_type": u.get("egg_type"),
+                "egg_hatch_time": u.get("egg_hatch_time", 0)
+            },
+            "pokedex": pokes_list
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def api_catch_handler(request):
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        ball_type = data.get("ball_type", "poke")
         
-        crit_str1 = " <b>КРИТ!</b>" if is_crit1 else ""
-        eff_str1 = " (Стихийный бонус!)" if mult1 > 1.0 else ""
-        round_logs.append(f"🔴 <b>{html.escape(p1_data['poke_name'])}</b> применил «{p1_skill}»{crit_str1}{eff_str1}: -{dmg1} HP")
+        u = get_user_data(uid)
+        if u["energy"] < 20:
+            return web.json_response({"status": "error", "message": "Недостаточно энергии!"})
 
-        # Ход Игрока 2 (если жив)
-        if p2_hp > 0:
-            p2_skills = SKILLS.get(p2_type, ["Атака"])
-            p2_skill = random.choice(p2_skills)
-            mult2 = 1.4 if p1_type in TYPE_ADVANTAGE.get(p2_type, []) else 1.0
-            dmg2 = int(random.randint(22, 38) * mult2)
-            is_crit2 = random.random() < 0.20
-            if is_crit2: dmg2 = int(dmg2 * 1.5)
-            p1_hp = max(0, p1_hp - dmg2)
-            
-            crit_str2 = " <b>КРИТ!</b>" if is_crit2 else ""
-            eff_str2 = " (Стихийный бонус!)" if mult2 > 1.0 else ""
-            round_logs.append(f"🔵 <b>{html.escape(p2_data['poke_name'])}</b> ответил «{p2_skill}»{crit_str2}{eff_str2}: -{dmg2} HP")
+        update_user(uid, energy=u["energy"] - 20, last_energy_calc=time.time())
 
-        # Анимация раунда
-        p1_bar = build_hp_bar(p1_hp, p1_max_hp)
-        p2_bar = build_hp_bar(p2_hp, p2_max_hp)
-        frame_text = (
-            f"⚔️ <b>АРЕНА БИТВЫ (Раунд {round_num})</b>\n\n"
-            f"🔴 <b>{html.escape(str(p1_data['name']))}</b>: {html.escape(str(p1_data['poke_name']))} ({p1_type})\n"
-            f"❤️ [{p1_bar}] {p1_hp}/{p1_max_hp} HP\n\n"
-            f"VS\n\n"
-            f"🔵 <b>{html.escape(str(p2_data['name']))}</b>: {html.escape(str(p2_data['poke_name']))} ({p2_type})\n"
-            f"❤️ [{p2_bar}] {p2_hp}/{p2_max_hp} HP\n\n"
-            f"📜 " + "\n📜 ".join(round_logs)
-        )
-        try:
-            await target_msg.edit_text(frame_text, parse_mode="HTML")
-        except Exception:
-            pass
+        # Определение редкости
+        is_ultra = ball_type == "ultra" and u["ultraballs"] > 0
+        if is_ultra:
+            update_user(uid, ultraballs=u["ultraballs"] - 1)
 
-        if p1_hp <= 0 or p2_hp <= 0:
-            break
-        await asyncio.sleep(1.3)
+        roll = random.randint(1, 100)
+        rarity = ("Rare" if roll <= 60 else "Epic" if roll <= 92 else "Legendary") if is_ultra else ("Common" if roll <= 65 else "Uncommon" if roll <= 88 else "Rare")
+        
+        candidates = POKEMON_DB.get(rarity, POKEMON_DB["Common"])
+        p_tuple = random.choice(candidates)
+        pid, name, gen = p_tuple[0], p_tuple[1], p_tuple[2]
+        
+        shiny = 1 if random.random() < 0.05 else 0
+        cp = generate_cp(rarity, bool(shiny))
+        
+        save_pokemon(uid, pid, name, gen, rarity, shiny, 0, 0, cp)
+        change_coins(uid, 15)
 
-    await asyncio.sleep(0.8)
+        return web.json_response({
+            "status": "success",
+            "pokemon": {
+                "id": pid, "name": name, "gen": gen, "rarity": rarity,
+                "is_shiny": bool(shiny), "cp": cp, "type": POKEMON_TYPES.get(pid, "⚪️ Обычный")
+            }
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    # Итог битвы
-    winner_p1 = p1_hp >= p2_hp
-
-    if battle_type == "rocket":
-        if winner_p1:
-            meta = metadata or {}
-            save_pokemon(p1_data["id"], meta["reward_pid"], meta["reward_name"], "Rare", 0, 1, 0, meta["reward_cp"])
-            change_coins(p1_data["id"], 35)
-            await target_msg.edit_text(
-                f"🎉 <b>ПОБЕДА НАД КОМАНДОЙ R!</b>\n\n"
-                f"Вы спасли покемона: <b>☠️ Теневой {html.escape(meta['reward_name'])} ({meta['reward_cp']} CP)</b>!\n"
-                f"💰 Награда: <b>+35 🪙 монет</b>!\n"
-                f"💡 <i>Очистите его в Питомнике для бонуса характеристик.</i>",
-                parse_mode="HTML"
-            )
-        else:
-            await target_msg.edit_text("💀 <b>ПОРАЖЕНИЕ!</b> Бандиты Команды R оказались сильнее и скрылись.", parse_mode="HTML")
-
-    elif battle_type == "tower":
-        tid = metadata["tower_id"]
-        if winner_p1:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute("SELECT champ_id, last_payout, rate_hr, name FROM towers WHERE tower_id = ?", (tid,))
-            old_t = cur.fetchone()
-            
-            # Выплата дани старому чемпиону
-            if old_t and old_t[0] > 0:
-                hours = max(1, int((time.time() - old_t[1]) / 3600))
-                payout = hours * old_t[2]
-                change_coins(old_t[0], payout)
-                try:
-                    await target_msg.bot.send_message(
-                        old_t[0],
-                        f"🏰 Вашего бойца выбили из <b>{old_t[3]}</b>!\n💰 Накопленная дань: <b>+{payout} 🪙 монет</b> начислена на ваш баланс.",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-
-            cur.execute("""
-                UPDATE towers 
-                SET champ_id = ?, champ_name = ?, p_name = ?, p_id = ?, p_cp = ?, last_payout = ?
-                WHERE tower_id = ?
-            """, (p1_data["id"], p1_data["name"], p1_data["poke_name"], p1_data["poke_id"], p1_data["cp"], time.time(), tid))
-            conn.commit()
-            cur.close()
-            conn.close()
-            await target_msg.edit_text(
-                f"👑 <b>ВЫ ЗАХВАТИЛИ БАШНЮ!</b>\n\n"
-                f"Ваш <b>{html.escape(p1_data['poke_name'])} ({p1_data['cp']} CP)</b> занял трон.\n"
-                f"Теперь вам начисляется пассивный доход каждый час!",
-                parse_mode="HTML"
-            )
-        else:
-            await target_msg.edit_text("💀 <b>ШТУРМ ПРОВАЛЕН!</b> Защитник башни отразил ваше нападение.", parse_mode="HTML")
-
-    elif battle_type == "duel":
-        bet = metadata.get("bet", 25)
-        winner_id = p1_data["id"] if winner_p1 else p2_data["id"]
-        loser_id = p2_data["id"] if winner_p1 else p1_data["id"]
-        winner_name = p1_data["name"] if winner_p1 else p2_data["name"]
-        loser_name = p2_data["name"] if winner_p1 else p1_data["name"]
-
-        change_coins(winner_id, bet)
-        change_coins(loser_id, -bet)
-
-        await target_msg.edit_text(
-            f"🏆 <b>ДУЭЛЬ ЗАВЕРШИЛАСЬ!</b>\n\n"
-            f"Победитель: <b>{html.escape(winner_name)}</b> (+{bet} 🪙)\n"
-            f"Проигравший: <b>{html.escape(loser_name)}</b> (-{bet} 🪙)",
-            parse_mode="HTML"
-        )
-
-# ================= 5. ГЛАВНОЕ МЕНЮ И СЛЭШ-КОМАНДЫ =================
-def get_main_keyboard():
-    b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text="🌿 Искать в траве"))
-    b.row(KeyboardButton(text="🖼 Покедекс"), KeyboardButton(text="👤 Профиль"))
-    b.row(KeyboardButton(text="🏰 Башни"), KeyboardButton(text="🏪 Магазин"))
-    b.row(KeyboardButton(text="🧬 Питомник"), KeyboardButton(text="🧬 Эволюция"))
-    b.row(KeyboardButton(text="🌲 Экспедиция"), KeyboardButton(text="🏷 Рынок"))
-    b.row(KeyboardButton(text="🎰 Рулетка"), KeyboardButton(text="🧩 Викторина"), KeyboardButton(text="🎁 Бонус"))
-    return b.as_markup(resize_keyboard=True)
-
-async def setup_bot_commands(bot: Bot):
-    user_commands = [
-        BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="pokedex", description="🎒 Открыть Покедекс"),
-        BotCommand(command="profile", description="👤 Профиль тренера"),
-        BotCommand(command="shop", description="🏪 Магазин предметов"),
-        BotCommand(command="evolve", description="🧬 Центр Эволюции"),
-        BotCommand(command="towers", description="🏰 Башни Чемпионов"),
-        BotCommand(command="spin", description="🎰 Бесплатная рулетка"),
-        BotCommand(command="quiz", description="🧩 Викторина стихий"),
-        BotCommand(command="daily", description="🎁 Ежедневный бонус"),
-        BotCommand(command="duel", description="⚔️ Вызов на дуэль (в ответ на смс)"),
-        BotCommand(command="market", description="🏷 Рынок игроков"),
-        BotCommand(command="sell", description="📦 Продать покемона (/sell 1 100)"),
-        BotCommand(command="id", description="🆔 Узнать свой ID")
-    ]
-    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
-
-async def register_admin_commands_for_user(bot: Bot, user_id: int):
-    admin_commands = [
-        BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="pokedex", description="🎒 Покедекс"),
-        BotCommand(command="profile", description="👤 Профиль"),
-        BotCommand(command="shop", description="🏪 Магазин"),
-        BotCommand(command="evolve", description="🧬 Эволюция"),
-        BotCommand(command="towers", description="🏰 Башни"),
-        BotCommand(command="spin", description="🎰 Рулетка"),
-        BotCommand(command="quiz", description="🧩 Викторина"),
-        BotCommand(command="daily", description="🎁 Бонус"),
-        BotCommand(command="stats", description="📊 [АДМИН] Статистика сервера"),
-        BotCommand(command="give_legendary", description="👑 [АДМИН] Выдать Легендарного"),
-        BotCommand(command="give_pokemon", description="👑 [АДМИН] Выдать покемона"),
-        BotCommand(command="give_coins", description="👑 [АДМИН] Начислить монеты"),
-        BotCommand(command="give_items", description="👑 [АДМИН] Начислить ресурсы")
-    ]
+async def api_buy_handler(request):
     try:
-        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=user_id))
-    except Exception:
-        pass
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        item = data.get("item", "")
+        cost = SHOP_PRICES.get(item, 999999)
 
+        u = get_user_data(uid)
+        if u["coins"] < cost:
+            return web.json_response({"status": "error", "message": "Недостаточно монет!"})
+
+        change_coins(uid, -cost)
+        now = time.time()
+
+        if item == "lure":
+            update_user(uid, energy=100, lures=u["lures"] + 1)
+        elif item == "ultraball":
+            update_user(uid, ultraballs=u["ultraballs"] + 1)
+        elif item == "candies_3":
+            change_candies(uid, 3)
+        elif item == "egg_rare":
+            update_user(uid, egg_type="Rare", egg_hatch_time=now + 5*3600)
+        elif item == "vip_7d":
+            cur_vip = max(now, u.get("vip_until", 0))
+            update_user(uid, vip_until=cur_vip + 7*86400)
+
+        return web.json_response({"status": "success", "coins": u["coins"] - cost})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def api_create_stars_invoice(request, bot: Bot):
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        stars_amount = int(data.get("stars", 50))
+        title = data.get("title", "1 000 Монет")
+
+        # Создаем официальную ссылку оплаты Telegram Stars (XTR)
+        link = await bot.create_invoice_link(
+            title=f"Покупка: {title}",
+            description=f"Начисление товаров в PokéHunter MMO для ID {uid}",
+            payload=f"stars_{uid}_{stars_amount}_{int(time.time())}",
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=stars_amount)]
+        )
+        return web.json_response({"status": "ok", "invoice_url": link})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# ================= 5. TELEGRAM БОТ ХЕНДЛЕРЫ =================
 dp = Dispatcher()
 
-# ----------------- СТАРТ И ПРОФИЛЬ -----------------
+async def setup_bot_commands(bot: Bot):
+    cmds = [
+        BotCommand(command="start", description="🎮 Запустить Mini App"),
+        BotCommand(command="profile", description="👤 Мой профиль"),
+        BotCommand(command="pokedex", description="🎒 Покедекс"),
+        BotCommand(command="shop", description="🏪 Магазин"),
+        BotCommand(command="id", description="🆔 Мой ID")
+    ]
+    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message, command: CommandObject):
-    user = get_user_data(message.from_user.id, message.from_user.username or "")
+async def cmd_start(message: types.Message):
+    get_user_data(message.from_user.id, message.from_user.username or "")
     
-    if check_admin(message.from_user):
-        await register_admin_commands_for_user(message.bot, message.from_user.id)
+    # Кнопка открытия Mini App прямо в сообщении
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🎮 Открыть PokéHunter App 3.0", web_app=WebAppInfo(url=WEBAPP_URL)))
 
-    if command.args and command.args.startswith("ref_") and user["referred_by"] == 0:
-        try:
-            inviter = int(command.args.replace("ref_", ""))
-            if inviter != message.from_user.id:
-                update_user(message.from_user.id, referred_by=inviter)
-                change_coins(message.from_user.id, 40)
-                change_coins(inviter, 60)
-                change_candies(inviter, 2)
-                try:
-                    await message.bot.send_message(inviter, f"🎉 Друг <b>{html.escape(message.from_user.first_name)}</b> пришел по ссылке! +60 🪙 и +2 🍬!", parse_mode="HTML")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    admin_str = "\n👑 <b>Главный Администратор!</b> Меню команд / обновлено." if check_admin(message.from_user) else ""
     await message.answer(
-        f"👋 <b>Добро пожаловать в PokéHunter MMO (386 Покемонов)!</b>{admin_str}\n\n"
-        "🎮 <b>Активности в мире покемонов:</b>\n"
-        "• 🌿 <b>Охота</b> — ловите покемонов и побеждайте бандитов!\n"
-        "• 🏪 <b>Магазин</b> — покупайте приманки, ультраболы и VIP!\n"
-        "• 🧬 <b>Эволюция</b> — развивайте монстров в старшие формы!\n"
-        "• 🖼 <b>Покедекс</b> — листайте HD-галерею карточек с артами!\n"
-        "• 🏰 <b>Башни Чемпионов</b> — захватывайте троны за пассивный доход!\n"
-        "• ⚔️ <b>Дуэли /duel</b> — анимированные зрелищные бои!\n"
-        "• 🎰 <b>Рулетка</b>, 🧩 <b>Викторина</b> и 🎁 <b>Бонус со стриком</b>!",
-        reply_markup=get_main_keyboard(),
+        f"👋 <b>Добро пожаловать в PokéHunter MMO 3.0!</b>\n\n"
+        f"• 🌐 <b>5 Поколений</b> (649 покемонов)\n"
+        f"• ⚡️ <b>Шкала энергии</b> и охота без задержек\n"
+        f"• 🏰 <b>7 Башен Чемпионов</b> с доходом\n"
+        f"• 🏆 <b>30 Достижений</b> и Магазин Звёзд\n\n"
+        f"Нажмите кнопку ниже, чтобы запустить графическое приложение!",
+        reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
 
 @dp.message(Command("id"))
 async def cmd_id(message: types.Message):
-    is_adm = check_admin(message.from_user)
-    if is_adm:
-        await register_admin_commands_for_user(message.bot, message.from_user.id)
-    adm_text = "✅ Да (Администратор)" if is_adm else "❌ Нет (Обычный игрок)"
-    await message.answer(
-        f"🆔 <b>Ваш профиль в Telegram:</b>\n\n"
-        f"• <b>User ID:</b> <code>{message.from_user.id}</code>\n"
-        f"• <b>Username:</b> @{html.escape(message.from_user.username or 'отсутствует')}\n"
-        f"• <b>Статус админа:</b> {adm_text}",
-        parse_mode="HTML"
-    )
+    await message.answer(f"🆔 Ваш Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
-@dp.message(F.text == "👤 Профиль")
-@dp.message(Command("profile"))
-async def cmd_profile(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    pokes = get_inventory(message.from_user.id)
-    total_cp = sum(p[7] for p in pokes)
-    best_p = pokes[0][2] if pokes else "Нет"
+# Оплата Telegram Stars
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
 
-    admin_tag = "👑 Главный Администратор\n" if check_admin(message.from_user) else ""
-    vip_tag = "⭐ VIP Активен\n" if time.time() < u.get("vip_until", 0) else ""
-    bot_info = await message.bot.get_me()
-    text = (
-        f"👤 <b>Тренер:</b> {html.escape(message.from_user.first_name)}\n"
-        f"{admin_tag}{vip_tag}"
-        f"🪙 Монеты: <b>{u['coins']}</b> | 🍬 Конфеты: <b>{u['candies']}</b>\n"
-        f"🍖 Приманки: <b>{u['lures']}</b> | 🔘 Ультраболы: <b>{u['ultraballs']}</b>\n"
-        f"🐾 В коллекции: <b>{len(pokes)} / 386</b> | ⚔️ Сила отряда: <b>{total_cp:,} CP</b>\n"
-        f"👑 Сильнейший боец: <b>{html.escape(best_p)}</b>\n"
-        f"🔥 Стрик бонуса: <b>{u['daily_streak']} дн.</b>\n\n"
-        f"🔗 Ваша реф-ссылка:\n<code>https://t.me/{bot_info.username}?start=ref_{message.from_user.id}</code>"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-# ----------------- 🏪 МАГАЗИН -----------------
-@dp.message(F.text == "🏪 Магазин")
-@dp.message(Command("shop"))
-async def show_shop_menu(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-    vip_status = "🟢 Активен" if now < u.get("vip_until", 0) else "⚪️ Не активен"
-
-    text = (
-        f"🏪 <b>МАГАЗИН ТОВАРОВ И УЛУЧШЕНИЙ</b>\n\n"
-        f"🪙 Ваш баланс: <b>{u['coins']} монет</b>\n"
-        f"⭐ VIP-статус: <b>{vip_status}</b>\n\n"
-        f"🍖 <b>Приманка</b> ({SHOP_PRICES['lure']} 🪙) — мгновенный сброс отдыха охоты\n"
-        f"🔘 <b>Ультрабол</b> ({SHOP_PRICES['ultraball']} 🪙) — 100% поимка + шанс на Эпиков\n"
-        f"🍬 <b>Конфеты эволюции x3</b> ({SHOP_PRICES['candies_3']} 🪙) — для развития покемонов\n"
-        f"🥚 <b>Эпическое Яйцо</b> ({SHOP_PRICES['egg']} 🪙) — созревает 6ч в Инкубаторе\n"
-        f"⭐ <b>VIP (7 дней)</b> ({SHOP_PRICES['vip_7d']} 🪙) — сокращает отдых охоты в 2 раза!"
-    )
-    b = InlineKeyboardBuilder()
-    b.row(
-        InlineKeyboardButton(text=f"🍖 Приманка ({SHOP_PRICES['lure']} 🪙)", callback_data="buy_item:lure"),
-        InlineKeyboardButton(text=f"🔘 Ультрабол ({SHOP_PRICES['ultraball']} 🪙)", callback_data="buy_item:ultraball")
-    )
-    b.row(
-        InlineKeyboardButton(text=f"🍬 Конфеты x3 ({SHOP_PRICES['candies_3']} 🪙)", callback_data="buy_item:candies_3"),
-        InlineKeyboardButton(text=f"🥚 Эпик Яйцо ({SHOP_PRICES['egg']} 🪙)", callback_data="buy_item:egg")
-    )
-    b.row(InlineKeyboardButton(text=f"⭐ VIP 7 дней ({SHOP_PRICES['vip_7d']} 🪙)", callback_data="buy_item:vip_7d"))
-    b.row(InlineKeyboardButton(text="⚡️ Использовать Приманку сейчас", callback_data="use_lure_now"))
-    await message.answer(text, reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("buy_item:"))
-async def process_shop_purchase(callback: CallbackQuery):
-    item = callback.data.split(":")[1]
-    cost = SHOP_PRICES.get(item, 999999)
-    u = get_user_data(callback.from_user.id, callback.from_user.username or "")
-
-    if u["coins"] < cost:
-        await callback.answer(f"❌ Недостаточно монет! Нужно {cost} 🪙 (у вас {u['coins']} 🪙)", show_alert=True)
-        return
-
-    change_coins(callback.from_user.id, -cost)
-    now = time.time()
-
-    if item == "lure":
-        update_user(callback.from_user.id, lures=u["lures"] + 1)
-        await callback.answer("✅ Куплена 🍖 Приманка (+1 в инвентарь)!", show_alert=True)
-    elif item == "ultraball":
-        update_user(callback.from_user.id, ultraballs=u["ultraballs"] + 1)
-        await callback.answer("✅ Куплен 🔘 Ультрабол (+1 в инвентарь)!", show_alert=True)
-    elif item == "candies_3":
-        change_candies(callback.from_user.id, 3)
-        await callback.answer("✅ Куплено 🍬 3 Конфеты эволюции!", show_alert=True)
-    elif item == "egg":
-        if u.get("egg_rarity"):
-            change_coins(callback.from_user.id, cost)
-            await callback.answer("❌ В инкубаторе уже зреет яйцо! Дождитесь вылупления.", show_alert=True)
-            return
-        update_user(callback.from_user.id, egg_rarity="Epic", egg_hatch_time=now + 6 * 3600)
-        await callback.answer("✅ Куплено 🥚 Эпическое Яйцо (в инкубаторе)!", show_alert=True)
-    elif item == "vip_7d":
-        current_vip = max(now, u.get("vip_until", 0))
-        update_user(callback.from_user.id, vip_until=current_vip + 7 * 86400)
-        await callback.answer("✅ ⭐ VIP-статус продлен на 7 дней! Охота каждые 2 часа.", show_alert=True)
-
-    # Обновление меню
-    u_new = get_user_data(callback.from_user.id)
-    vip_status = "🟢 Активен" if now < u_new.get("vip_until", 0) else "⚪️ Не активен"
-    new_text = (
-        f"🏪 <b>МАГАЗИН ТОВАРОВ И УЛУЧШЕНИЙ</b>\n\n"
-        f"🪙 Ваш баланс: <b>{u_new['coins']} монет</b>\n"
-        f"⭐ VIP-статус: <b>{vip_status}</b>\n\n"
-        f"🍖 <b>Приманка</b> ({SHOP_PRICES['lure']} 🪙) — мгновенный сброс отдыха охоты\n"
-        f"🔘 <b>Ультрабол</b> ({SHOP_PRICES['ultraball']} 🪙) — 100% поимка + шанс на Эпиков\n"
-        f"🍬 <b>Конфеты эволюции x3</b> ({SHOP_PRICES['candies_3']} 🪙) — для развития покемонов\n"
-        f"🥚 <b>Эпическое Яйцо</b> ({SHOP_PRICES['egg']} 🪙) — созревает 6ч в Инкубаторе\n"
-        f"⭐ <b>VIP (7 дней)</b> ({SHOP_PRICES['vip_7d']} 🪙) — сокращает отдых охоты в 2 раза!"
-    )
-    try:
-        await callback.message.edit_text(new_text, reply_markup=callback.message.reply_markup, parse_mode="HTML")
-    except Exception:
-        pass
-
-@dp.callback_query(F.data == "use_lure_now")
-async def process_use_lure(callback: CallbackQuery):
-    u = get_user_data(callback.from_user.id)
-    if u["lures"] <= 0:
-        await callback.answer("❌ У вас нет приманок! Купите их в магазине выше.", show_alert=True)
-        return
-    update_user(callback.from_user.id, lures=u["lures"] - 1, last_hunt=0)
-    await callback.answer("⚡️ Приманка использована! Охота готова, нажимайте '🌿 Искать в траве'!", show_alert=True)
-
-# ----------------- 🧬 ЭВОЛЮЦИЯ ПОКЕМОНОВ -----------------
-@dp.message(F.text == "🧬 Эволюция")
-@dp.message(Command("evolve"))
-async def show_evolution_menu(message: types.Message):
-    user = get_user_data(message.from_user.id, message.from_user.username or "")
-    pokes = get_inventory(message.from_user.id)
-
-    evolvable = []
-    for inv_id, pid, name, rarity, is_shiny, is_shadow, is_purified, cp in pokes:
-        if pid in EVOLUTIONS:
-            next_pid = EVOLUTIONS[pid]
-            next_info = ALL_POKEMON_MAP.get(next_pid)
-            if next_info:
-                evolvable.append((inv_id, pid, name, next_pid, next_info["name"], cp, is_shiny))
-
-    if not evolvable:
-        await message.answer(
-            f"🧬 <b>Центр Эволюции</b> (Баланс: <b>{user['candies']} 🍬</b>)\n\n"
-            "У вас пока нет покемонов, готовых к развитию. Ловите повторки на охоте, чтобы получать конфеты!",
-            parse_mode="HTML"
-        )
-        return
-
-    text = f"🧬 <b>ЦЕНТР ЭВОЛЮЦИИ (1-3 ПОКОЛЕНИЯ)</b>\n\n🍬 Ваш баланс: <b>{user['candies']} конфет</b> (Стоимость: <b>{EVOLVE_COST_CANDIES} 🍬</b>)\n\n"
-    builder = InlineKeyboardBuilder()
-
-    for inv_id, pid, name, next_pid, next_name, cp, shiny in evolvable[:8]:
-        shiny_tag = "✨ " if shiny else ""
-        text += f"• {shiny_tag}<b>{html.escape(name)}</b> ({cp} CP) ➡️ <b>{html.escape(next_name)}</b>\n"
-        builder.row(InlineKeyboardButton(text=f"🧬 Развить {name} (#{pid})", callback_data=f"evo_{inv_id}_{pid}_{next_pid}"))
-
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("evo_"))
-async def process_evolution(callback: CallbackQuery):
-    await callback.answer()
-    _, inv_id_str, old_pid_str, next_pid_str = callback.data.split("_")
-    inv_id, old_pid, next_pid = int(inv_id_str), int(old_pid_str), int(next_pid_str)
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    pay = message.successful_payment
+    uid = message.from_user.id
+    stars = pay.total_amount
     
-    user = get_user_data(callback.from_user.id, callback.from_user.username or "")
-    if user["candies"] < EVOLVE_COST_CANDIES:
-        await callback.message.reply(f"❌ Недостаточно конфет! Нужно <b>{EVOLVE_COST_CANDIES} 🍬</b> (у вас {user['candies']} 🍬).", parse_mode="HTML")
-        return
-
-    next_info = ALL_POKEMON_MAP.get(next_pid)
-    if not next_info: return
-
-    next_name = next_info["name"]
-    next_rarity = next_info["rarity"]
-    new_cp = generate_cp(next_rarity, False) + 380
-
-    change_candies(callback.from_user.id, -EVOLVE_COST_CANDIES)
-    replace_pokemon_evolution(inv_id, callback.from_user.id, next_pid, next_name, next_rarity, new_cp)
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    caption = (
-        f"✨ <b>ЭВОЛЮЦИЯ ЗАВЕРШЕНА!</b>\n\n"
-        f"🎉 Ваш покемон эволюционировал в <b>№{next_pid:03d} {html.escape(next_name)}</b>!\n"
-        f"🌟 Редкость: {RARITY_NAMES.get(next_rarity, 'Обычный')}\n"
-        f"⚔️ Новая боевая мощь: <b>{new_cp} CP</b>!"
-    )
-    img_url = get_pokemon_image_url(next_pid, False)
-    try:
-        await callback.message.answer_photo(photo=img_url, caption=caption, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(caption, parse_mode="HTML")
-
-# ----------------- 🖼 ВИЗУАЛЬНЫЙ ПОКЕДЕКС -----------------
-@dp.message(F.text == "🖼 Покедекс")
-@dp.message(Command("pokedex"))
-async def show_pokedex(message: types.Message):
-    pokes = get_inventory(message.from_user.id)
-    if not pokes:
-        await message.answer("🎒 В вашем Покедексе пока пусто. Нажмите <b>🌿 Искать в траве</b>!", parse_mode="HTML")
-        return
-    await send_pokedex_page(message, message.from_user.id, 0)
-
-async def send_pokedex_page(event, user_id: int, idx: int, edit: bool = False):
-    pokes = get_inventory(user_id)
-    if not pokes: return
-    idx = max(0, min(idx, len(pokes) - 1))
-    
-    p = pokes[idx]
-    pid, name, rarity, is_shiny, is_shadow, is_purified, cp = p[1], p[2], p[3], p[4], p[5], p[6], p[7]
-    
-    status_tag = ""
-    if is_shiny: status_tag += " ✨ ШАЙНИ"
-    if is_shadow: status_tag += " ☠️ ТЕНЕВОЙ"
-    if is_purified: status_tag += " 🕊 ОЧИЩЕННЫЙ"
-    
-    ptype = POKEMON_TYPES.get(pid, "⚪️ Обычный")
-    caption = (
-        f"🎒 <b>ПОКЕДЕКС (№{idx+1} из {len(pokes)} | Всего видов: 386)</b>\n\n"
-        f"🏷 <b>{html.escape(name)}</b> #{pid:03d}{status_tag}\n"
-        f"🌟 Редкость: {RARITY_NAMES.get(rarity, 'Обычный')}\n"
-        f"🧬 Стихия: {ptype}\n"
-        f"⚔️ Мощь: <b>{cp} CP</b>"
-    )
-    builder = InlineKeyboardBuilder()
-    prev_idx = len(pokes) - 1 if idx == 0 else idx - 1
-    next_idx = 0 if idx == len(pokes) - 1 else idx + 1
-    
-    builder.row(
-        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pdx_{user_id}_{prev_idx}"),
-        InlineKeyboardButton(text=f"{idx+1} / {len(pokes)}", callback_data="none"),
-        InlineKeyboardButton(text="Вперед ➡️", callback_data=f"pdx_{user_id}_{next_idx}")
-    )
-    img_url = get_pokemon_image_url(pid, bool(is_shiny))
-    
-    if edit:
-        try:
-            await event.message.edit_media(
-                media=InputMediaPhoto(media=img_url, caption=caption, parse_mode="HTML"),
-                reply_markup=builder.as_markup()
-            )
-        except Exception:
-            pass
-    else:
-        try:
-            await event.answer_photo(photo=img_url, caption=caption, reply_markup=builder.as_markup(), parse_mode="HTML")
-        except Exception:
-            await event.answer(caption, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("pdx_"))
-async def pdx_navigation(callback: CallbackQuery):
-    await callback.answer()
-    _, uid_str, idx_str = callback.data.split("_")
-    uid, idx = int(uid_str), int(idx_str)
-    if callback.from_user.id != uid:
-        return
-    await send_pokedex_page(callback, uid, idx, edit=True)
-
-# ----------------- 🎁 БОНУС СО СТРИКОМ -----------------
-@dp.message(F.text == "🎁 Бонус")
-@dp.message(Command("daily"))
-async def cmd_daily(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-    admin_mode = check_admin(message.from_user)
-
-    if not admin_mode and (now - u["last_daily"]) < COOLDOWN_DAILY:
-        rem = int(COOLDOWN_DAILY - (now - u["last_daily"]))
-        await message.answer(f"⏳ Бонус уже получен! Приходите через <b>{rem//3600} ч. {(rem%3600)//60} мин.</b>", parse_mode="HTML")
-        return
-
-    diff = now - u["last_daily"]
-    streak = u["daily_streak"] + 1 if diff < (48 * 3600) else 1
-    if streak > 7: streak = 1
-
-    r = DAILY_STREAK_REWARDS[streak]
-    change_coins(message.from_user.id, r["coins"])
-    change_candies(message.from_user.id, r["candies"])
-    update_user(message.from_user.id, 
-                lures=u["lures"] + r["lures"], 
-                ultraballs=u["ultraballs"] + r["ultraballs"],
-                last_daily=now,
-                daily_streak=streak)
-
-    egg_str = "\n🥚 <b>СУПЕР-ПРИЗ:</b> Эпическое Яйцо в Инкубатор!" if r["egg"] else ""
-    if r["egg"]:
-        update_user(message.from_user.id, egg_rarity="Epic", egg_hatch_time=now + 6*3600)
-
-    await message.answer(
-        f"🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС (День {streak}/7)</b>\n\n"
-        f"Получено:\n"
-        f"• <b>+{r['coins']} 🪙 монет</b>\n"
-        f"• <b>+{r['candies']} 🍬 конфет</b>\n"
-        f"• <b>+{r['lures']} 🍖 приманок</b> | <b>+{r['ultraballs']} 🔘 ультраболов</b>{egg_str}\n\n"
-        f"Заходите каждый день за наградой!",
-        parse_mode="HTML"
-    )
-
-# ----------------- 🌿 ОХОТА + КОМАНДА R (АНИМАЦИЯ) -----------------
-@dp.message(F.text == "🌿 Искать в траве")
-@dp.message(Command("hunt"))
-async def cmd_hunt(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-    admin_mode = check_admin(message.from_user)
-    cooldown = COOLDOWN_HUNT_VIP if now < u.get("vip_until", 0) else COOLDOWN_HUNT_DEFAULT
-
-    if not admin_mode and (now - u["last_hunt"]) < cooldown:
-        rem = int(cooldown - (now - u["last_hunt"]))
-        await message.answer(f"⏳ Отдых: <b>{rem//3600} ч. {(rem%3600)//60} мин.</b>\n💡 <i>Используйте Приманку из Магазина для мгновенной охоты!</i>", parse_mode="HTML")
-        return
-
-    # Засада Команды R (12%)
-    if random.random() < 0.12:
-        if not admin_mode: update_user(message.from_user.id, last_hunt=now)
-        user_pokes = get_inventory(message.from_user.id)
-        if user_pokes:
-            my_p = user_pokes[0]
-            p1_data = {"id": message.from_user.id, "name": message.from_user.first_name, "poke_name": my_p[2], "poke_id": my_p[1], "cp": my_p[7]}
-            r_pid, r_name = random.choice(POKEMON_DB["Rare"])
-            r_cp = random.randint(400, 1500)
-            p2_data = {"id": 0, "name": "Бандит Команды R", "poke_name": f"Теневой {r_name}", "poke_id": r_pid, "cp": r_cp}
-            
-            battle_msg = await message.answer("🏴‍☠️ <b>ЗАСАДА КОМАНДЫ R!</b> Начинается анимированный бой...", parse_mode="HTML")
-            await run_animated_battle(battle_msg, p1_data, p2_data, "rocket", {"reward_pid": r_pid, "reward_name": r_name, "reward_cp": r_cp})
-            return
-
-    used_ultraball = u["ultraballs"] > 0
-    if used_ultraball:
-        update_user(message.from_user.id, ultraballs=u["ultraballs"] - 1)
-
-    roll = random.randint(1, 100)
-    if not used_ultraball and roll <= 20:
-        if not admin_mode: update_user(message.from_user.id, last_hunt=now)
-        await message.answer("💨 Покемон испугался и скрылся в кустах!", parse_mode="HTML")
-        return
-
-    rarity = ("Common" if roll <= 45 else "Rare" if roll <= 75 else "Epic" if roll <= 92 else "Legendary") if used_ultraball else ("Common" if roll <= 70 else "Rare" if roll <= 90 else "Epic" if roll <= 98 else "Legendary")
-    pid, name = random.choice(POKEMON_DB[rarity])
-    shiny = 1 if random.random() < 0.05 else 0
-    cp = generate_cp(rarity, bool(shiny))
-    is_new = save_pokemon(message.from_user.id, pid, name, rarity, shiny, 0, 0, cp)
-    
-    if not admin_mode: update_user(message.from_user.id, last_hunt=now)
-    ball_tag = "\n🔘 <i>Использован Ультрабол!</i>" if used_ultraball else ""
-    shiny_tag = "✨ ШАЙНИ " if shiny else ""
-
-    if is_new:
-        caption = f"🎉 <b>Вы поймали покемона:</b>{ball_tag}\n\n🏷 <b>№{pid:03d} {shiny_tag}{html.escape(name)}</b>\n🌟 {RARITY_NAMES[rarity]} | 🧬 {POKEMON_TYPES.get(pid, '⚪️')}\n⚔️ <b>{cp} CP</b>"
-    else:
-        rc = COIN_REWARDS[rarity]
-        rk = 1 if rarity in ["Common", "Rare"] else 2
-        change_coins(message.from_user.id, rc)
-        change_candies(message.from_user.id, rk)
-        caption = f"📦 Повторка: <b>№{pid:03d} {shiny_tag}{html.escape(name)}</b> ({cp} CP).{ball_tag}\n+<b>{rc} 🪙</b> и +<b>{rk} 🍬</b>!"
-
-    try:
-        await message.answer_photo(photo=get_pokemon_image_url(pid, bool(shiny)), caption=caption, parse_mode="HTML")
-    except Exception:
-        await message.answer(caption, parse_mode="HTML")
-
-# ----------------- ⚔️ ДУЭЛИ МЕЖДУ ИГРОКАМИ (/duel) -----------------
-@dp.message(Command("duel"))
-async def cmd_duel(message: types.Message):
-    challenger = message.from_user
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("⚔️ <b>Как бросить вызов:</b> ответьте на сообщение игрока и напишите <code>/duel</code>!", parse_mode="HTML")
-        return
-
-    target = message.reply_to_message.from_user
-    if target.is_bot or target.id == challenger.id:
-        await message.reply("❌ Нельзя вызвать этого пользователя на дуэль.")
-        return
-
-    p1_pokes = get_inventory(challenger.id)
-    p2_pokes = get_inventory(target.id)
-    if not p1_pokes or not p2_pokes:
-        await message.reply("❌ У одного из тренеров еще нет покемонов в коллекции!")
-        return
-
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="⚔️ Принять бой!", callback_data=f"pvp_acc_{challenger.id}_{target.id}"),
-        InlineKeyboardButton(text="🏳️ Отклонить", callback_data=f"pvp_dec_{challenger.id}_{target.id}")
-    )
-    await message.answer(
-        f"⚔️ <b>ВЫЗОВ НА ДУЭЛЬ!</b>\n\n"
-        f"🔴 Тренер <b>{html.escape(challenger.first_name)}</b> бросает вызов 🔵 <b>{html.escape(target.first_name)}</b>!\n"
-        f"💰 Награда победителю: <b>25 🪙 монет</b>",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("pvp_dec_"))
-async def pvp_decline(callback: CallbackQuery):
-    await callback.answer()
-    _, _, c_id, t_id = callback.data.split("_")
-    if callback.from_user.id not in [int(c_id), int(t_id)]:
-        return
-    await callback.message.edit_text("🏳️ <b>Дуэль была отменена.</b>", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("pvp_acc_"))
-async def pvp_accept(callback: CallbackQuery):
-    await callback.answer()
-    _, _, c_id_str, t_id_str = callback.data.split("_")
-    c_id, t_id = int(c_id_str), int(t_id_str)
-    if callback.from_user.id != t_id:
-        return
-
-    p1_pokes = get_inventory(c_id)
-    p2_pokes = get_inventory(t_id)
-    if not p1_pokes or not p2_pokes:
-        return
-
-    u1 = get_user_data(c_id)
-    p1_name = f"@{u1['username']}" if u1.get("username") else "Тренер 1"
-
-    p1_data = {"id": c_id, "name": p1_name, "poke_name": p1_pokes[0][2], "poke_id": p1_pokes[0][1], "cp": p1_pokes[0][7]}
-    p2_data = {"id": t_id, "name": callback.from_user.first_name, "poke_name": p2_pokes[0][2], "poke_id": p2_pokes[0][1], "cp": p2_pokes[0][7]}
-
-    await run_animated_battle(callback.message, p1_data, p2_data, "duel", {"bet": 25})
-
-# ----------------- 🏰 БАШНИ ЧЕМПИОНОВ (АНИМАЦИЯ) -----------------
-@dp.message(F.text == "🏰 Башни")
-@dp.message(Command("towers"))
-async def show_towers(message: types.Message):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT tower_id, name, req_cp, champ_name, p_name, p_cp, rate_hr, last_payout, champ_id FROM towers ORDER BY tower_id ASC")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    now = time.time()
-    text = "🏰 <b>БАШНИ ЧЕМПИОНОВ (КАНТО, ДЖОТО, ХОЭНН)</b>\n\nЗахватывайте башни и получайте пассивный доход монетами каждый час!\n\n"
-    builder = InlineKeyboardBuilder()
-    for tid, tname, req_cp, cname, pname, pcp, rate, last_pay, cid in rows:
-        bank = max(0, int((now - last_pay) / 3600 * rate)) if cid > 0 else 0
-        text += (
-            f"• <b>{tname}</b> (от {req_cp} CP)\n"
-            f"  👑 Чемпион: <b>{html.escape(cname)}</b> | Боец: <b>{html.escape(pname)}</b> ({pcp} CP)\n"
-            f"  💰 Доход: <b>+{rate} 🪙/час</b> (В банке: {bank} 🪙)\n\n"
-        )
-        builder.row(InlineKeyboardButton(text=f"⚔️ Штурм {tname}", callback_data=f"tw_atk_{tid}"))
-
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("tw_atk_"))
-async def tower_attack(callback: CallbackQuery):
-    await callback.answer()
-    tid = int(callback.data.split("_")[2])
-    pokes = get_inventory(callback.from_user.id)
-    if not pokes:
-        await callback.message.reply("У вас нет покемонов для штурма!")
-        return
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT tower_id, name, req_cp, champ_id, champ_name, p_name, p_id, p_cp FROM towers WHERE tower_id = ?", (tid,))
-    t = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    my_p = pokes[0]
-    if my_p[7] < t[2]:
-        await callback.message.reply(f"❌ Ваш сильнейший боец ({my_p[7]} CP) слабее порога башни ({t[2]} CP)!")
-        return
-
-    p1_data = {"id": callback.from_user.id, "name": callback.from_user.first_name, "poke_name": my_p[2], "poke_id": my_p[1], "cp": my_p[7]}
-    p2_data = {"id": t[3], "name": t[4], "poke_name": t[5], "poke_id": t[6], "cp": t[7]}
-
-    await run_animated_battle(callback.message, p1_data, p2_data, "tower", {"tower_id": tid})
-
-# ----------------- 🌲 ЭКСПЕДИЦИИ -----------------
-@dp.message(F.text == "🌲 Экспедиция")
-async def show_expeditions(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-
-    if u["expedition_tier"] > 0:
-        if now >= u["expedition_end"]:
-            tier = u["expedition_tier"]
-            rc, rk, ub = (25, 1, 0) if tier == 1 else ((60, 2, 0) if tier == 2 else (140, 4, 1))
-            change_coins(message.from_user.id, rc)
-            change_candies(message.from_user.id, rk)
-            update_user(message.from_user.id, ultraballs=u["ultraballs"] + ub, expedition_tier=0, expedition_end=0)
-            await message.answer(f"🌲 <b>Экспедиция вернулась!</b> +{rc} 🪙, +{rk} 🍬" + (", +1 🔘 Ультрабол" if ub else "!"), parse_mode="HTML")
-        else:
-            rem = int(u["expedition_end"] - now)
-            await message.answer(f"🌲 <b>Отряд в походе.</b> Возврат через: <b>{rem//3600} ч. {(rem%3600)//60} мин.</b>", parse_mode="HTML")
-        return
-
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🌿 Лес Илекс (1ч) -> 25🪙 + 1🍬", callback_data="exp_1"))
-    b.row(InlineKeyboardButton(text="⛰ Гора Коронет (3ч) -> 60🪙 + 2🍬", callback_data="exp_2"))
-    b.row(InlineKeyboardButton(text="🌋 Вулкан Лаваридж (6ч) -> 140🪙 + 4🍬 + 🔘", callback_data="exp_3"))
-    await message.answer("🌲 <b>Выберите маршрут экспедиции:</b>", reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("exp_"))
-async def start_exp(callback: CallbackQuery):
-    await callback.answer()
-    t = int(callback.data.split("_")[1])
-    dur = {1: 3600, 2: 10800, 3: 21600}[t]
-    update_user(callback.from_user.id, expedition_tier=t, expedition_end=time.time() + dur)
-    await callback.message.edit_text("🚀 <b>Покемоны отправились в путь!</b>", parse_mode="HTML")
-
-# ----------------- 🎰 РУЛЕТКА И 🧩 ВИКТОРИНА -----------------
-@dp.message(F.text == "🎰 Рулетка")
-@dp.message(Command("spin"))
-async def cmd_spin(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-    admin_mode = check_admin(message.from_user)
-
-    if not admin_mode and (now - u["last_spin"]) < COOLDOWN_SPIN:
-        rem = int(COOLDOWN_SPIN - (now - u["last_spin"]))
-        await message.answer(f"⏳ Спин доступен через: <b>{rem//3600} ч. {(rem%3600)//60} мин.</b>", parse_mode="HTML")
-        return
-
-    update_user(message.from_user.id, last_spin=now)
-    msg = await message.answer("🎰 <code>[ 🌀 Вращение Колеса Фортуны... ]</code>", parse_mode="HTML")
-    await asyncio.sleep(0.8)
-
-    roll = random.randint(1, 100)
-    if roll <= 40:
-        change_coins(message.from_user.id, 25)
-        p = "🪙 <b>+25 Монет</b>!"
-    elif roll <= 70:
-        change_candies(message.from_user.id, 3)
-        p = "🍬 <b>+3 Конфеты</b>!"
-    elif roll <= 85:
-        update_user(message.from_user.id, lures=u["lures"] + 1)
-        p = "🍖 <b>+1 Приманка</b>!"
-    elif roll <= 97:
-        update_user(message.from_user.id, ultraballs=u["ultraballs"] + 1)
-        p = "🔘 <b>+1 Ультрабол</b>!"
-    else:
-        pid, name = random.choice(POKEMON_DB["Legendary"])
-        cp = generate_cp("Legendary", False)
-        save_pokemon(message.from_user.id, pid, name, "Legendary", 0, 0, 0, cp)
-        p = f"👑 <b>СУПЕР-ДЖЕКПОТ! Легендарный {html.escape(name)} ({cp} CP)!</b>"
-
-    await msg.edit_text(f"🎉 <b>ВЫИГРЫШ В РУЛЕТКЕ:</b>\n\n{p}", parse_mode="HTML")
-
-@dp.message(F.text == "🧩 Викторина")
-@dp.message(Command("quiz"))
-async def cmd_quiz(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-    admin_mode = check_admin(message.from_user)
-
-    attempts = u["quiz_attempts"]
-    if now >= u["quiz_reset_time"]:
-        attempts = QUIZ_MAX_ATTEMPTS
-        update_user(message.from_user.id, quiz_attempts=3, quiz_reset_time=now + QUIZ_RESET_INTERVAL)
-
-    if not admin_mode and attempts <= 0:
-        rem = int(u["quiz_reset_time"] - now)
-        await message.answer(f"🚫 Попытки на сегодня закончились! Обновление через <b>{rem//3600} ч.</b>", parse_mode="HTML")
-        return
-
-    if not admin_mode:
-        update_user(message.from_user.id, quiz_attempts=attempts - 1)
-
-    all_pids = [p for p in ALL_POKEMON_MAP.keys() if isinstance(p, int)]
-    pid = random.choice(all_pids)
-    c_name = ALL_POKEMON_MAP[pid]["name"]
-    c_type = POKEMON_TYPES.get(pid, "⚪️ Обычный")
-
-    all_t = list(set(POKEMON_TYPES.values()))
-    wrongs = random.sample([t for t in all_t if t != c_type], 3)
-    opts = wrongs + [c_type]
-    random.shuffle(opts)
-
-    b = InlineKeyboardBuilder()
-    for opt in opts:
-        b.row(InlineKeyboardButton(text=opt, callback_data=f"qz_{'1' if opt==c_type else '0'}"))
-
-    attempts_tag = " (👑 Безлимит)" if admin_mode else f" (⚡️ Осталось: {attempts}/3)"
-    caption = f"🧩 <b>ВИКТОРИНА (1-3 ПОКОЛЕНИЯ)!</b>{attempts_tag}\n\nПокемон: <b>№{pid:03d} {html.escape(c_name)}</b>\n💰 Награда: <b>+20 🪙 монет</b>!"
-    
-    img_url = get_pokemon_image_url(pid, False)
-    try:
-        await message.answer_photo(photo=img_url, caption=caption, reply_markup=b.as_markup(), parse_mode="HTML")
-    except Exception:
-        await message.answer(caption, reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("qz_"))
-async def process_quiz(callback: CallbackQuery):
-    await callback.answer()
-    if callback.data.split("_")[1] == "1":
-        change_coins(callback.from_user.id, 20)
-        await callback.message.reply("🎉 <b>Правильно! Получено +20 🪙 монет!</b>", parse_mode="HTML")
-    else:
-        await callback.message.reply("❌ <b>Неверно! Стихия не совпала.</b>", parse_mode="HTML")
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-# ----------------- 🧬 ПИТОМНИК -----------------
-@dp.message(F.text == "🧬 Питомник")
-async def show_breeding(message: types.Message):
-    u = get_user_data(message.from_user.id, message.from_user.username or "")
-    now = time.time()
-
-    if u["breeding_ready"] == 1:
-        update_user(message.from_user.id, breeding_ready=0, breeding_end=0, egg_rarity="Epic", egg_hatch_time=now + 6*3600)
-        await message.answer("🎉 <b>В питомнике выведено Эпическое Яйцо!</b> Оно созревает в Инкубаторе.", parse_mode="HTML")
-        return
-
-    if u["breeding_end"] > 0:
-        if now >= u["breeding_end"]:
-            update_user(message.from_user.id, breeding_ready=1)
-            b = InlineKeyboardBuilder()
-            b.row(InlineKeyboardButton(text="🥚 Забрать яйцо", callback_data="claim_egg"))
-            await message.answer("🐣 Яйцо готово! Заберите его:", reply_markup=b.as_markup())
-        else:
-            rem = int(u["breeding_end"] - now)
-            await message.answer(f"🧬 Покемоны в питомнике. Яйцо будет через: <b>{rem//3600} ч. {(rem%3600)//60} мин.</b>", parse_mode="HTML")
-        return
-
-    pokes = get_inventory(message.from_user.id)
-    if len(pokes) < 2:
-        await message.answer("❌ Нужно минимум 2 покемона!", parse_mode="HTML")
-        return
-
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="❤️ Посадить пару (4 ч)", callback_data="start_brd"))
-    await message.answer("🧬 <b>ПИТОМНИК:</b> Скрещивайте пару на 4 часа, чтобы получить особое яйцо!", reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "start_brd")
-async def start_breeding(callback: CallbackQuery):
-    await callback.answer()
-    update_user(callback.from_user.id, breeding_end=time.time() + BREEDING_DURATION, breeding_ready=0)
-    await callback.message.edit_text("❤️ <b>Пара в питомнике!</b> Возвращайтесь через 4 часа.", parse_mode="HTML")
-
-@dp.callback_query(F.data == "claim_egg")
-async def claim_egg(callback: CallbackQuery):
-    await callback.answer()
-    update_user(callback.from_user.id, breeding_ready=0, breeding_end=0, egg_rarity="Epic", egg_hatch_time=time.time() + 6*3600)
-    await callback.message.edit_text("🎉 <b>Эпическое Яйцо получено!</b>", parse_mode="HTML")
-
-# ----------------- 🏷 РЫНОК И ПРОДАЖА (/sell) -----------------
-@dp.message(Command("sell"))
-async def cmd_sell(message: types.Message, command: CommandObject):
-    args = command.args.split() if command.args else []
-    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
-        await message.answer("💡 <b>Как продать покемона:</b> <code>/sell &lt;номер_в_покедексе&gt; &lt;цена&gt;</code>\nПример: <code>/sell 1 150</code>", parse_mode="HTML")
-        return
-    idx, price = int(args[0]) - 1, int(args[1])
-    pokes = get_inventory(message.from_user.id)
-    if idx < 0 or idx >= len(pokes):
-        await message.answer("❌ Неверный номер покемона в вашем Покедексе!", parse_mode="HTML")
-        return
-    if price < 5 or price > 50000:
-        await message.answer("❌ Цена должна быть от 5 до 50 000 🪙!", parse_mode="HTML")
-        return
-    p = pokes[idx]
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM inventory WHERE id = ?", (p[0],))
-    sname = message.from_user.username or message.from_user.first_name
-    cur.execute("""
-        INSERT INTO market (seller_id, seller_name, pokemon_id, pokemon_name, rarity, is_shiny, is_shadow, cp, price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (message.from_user.id, sname, p[1], p[2], p[3], p[4], p[5], p[7], price))
-    conn.commit()
-    cur.close()
-    conn.close()
-    await message.answer(f"✅ <b>{html.escape(p[2])} ({p[7]} CP)</b> выставлен на <b>🏷 Рынок</b> за <b>{price} 🪙</b>!", parse_mode="HTML")
-
-@dp.message(F.text == "🏷 Рынок")
-@dp.message(Command("market"))
-async def show_market(message: types.Message):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT lot_id, seller_name, pokemon_name, rarity, is_shiny, cp, price FROM market ORDER BY lot_id DESC LIMIT 10")
-    lots = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    if not lots:
-        await message.answer("🏷 <b>Рынок пуст.</b> Выставите покемона командой:\n<code>/sell &lt;номер&gt; &lt;цена&gt;</code>", parse_mode="HTML")
-        return
-
-    text = "🏷 <b>ГЛОБАЛЬНЫЙ РЫНОК ПОКЕМОНОВ:</b>\n\n"
-    b = InlineKeyboardBuilder()
-    for lid, sname, pname, r, shiny, cp, price in lots:
-        s_tag = "✨ " if shiny else ""
-        text += f"• <b>Лот #{lid}:</b> {s_tag}<b>{html.escape(pname)}</b> ({cp} CP) — <b>{price} 🪙</b> (Продавец: {html.escape(sname)})\n"
-        b.row(InlineKeyboardButton(text=f"Купить #{lid} ({price} 🪙)", callback_data=f"buy_lot_{lid}"))
-
-    await message.answer(text, reply_markup=b.as_markup(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("buy_lot_"))
-async def buy_market_lot(callback: CallbackQuery):
-    await callback.answer()
-    lid = int(callback.data.split("_")[2])
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT lot_id, seller_id, pokemon_id, pokemon_name, rarity, is_shiny, is_shadow, cp, price FROM market WHERE lot_id = ?", (lid,))
-    lot = cur.fetchone()
-    if not lot:
-        cur.close()
-        conn.close()
-        await callback.message.reply("Лот уже продан!")
-        return
-
-    u = get_user_data(callback.from_user.id, callback.from_user.username or "")
-    if u["coins"] < lot[8]:
-        cur.close()
-        conn.close()
-        await callback.message.reply("Недостаточно монет!")
-        return
-
-    change_coins(callback.from_user.id, -lot[8])
-    change_coins(lot[1], lot[8])
-    save_pokemon(callback.from_user.id, lot[2], lot[3], lot[4], lot[5], lot[6], 0, lot[7])
-    cur.execute("DELETE FROM market WHERE lot_id = ?", (lid,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    await callback.message.edit_text(f"🎉 <b>Вы купили {html.escape(lot[3])} за {lot[8]} 🪙!</b>", parse_mode="HTML")
-
-# ================= 6. 👑 АДМИН-КОМАНДЫ =================
-def resolve_target_user(message: types.Message, args: list):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target = message.reply_to_message.from_user
-        return target.id, target.first_name, args
-
-    if not args:
-        return message.from_user.id, message.from_user.first_name, []
-
-    first_arg = args[0]
-    if first_arg.isdigit() and len(first_arg) >= 6:
-        uid = int(first_arg)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, username FROM users WHERE user_id = ?", (uid,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        name = f"@{row[1]}" if (row and row[1]) else f"ID {uid}"
-        return uid, name, args[1:]
-
-    if first_arg.startswith("@") or (len(args) >= 2 and not first_arg.isdigit() and not ALL_POKEMON_MAP.get(first_arg.lower())):
-        clean = first_arg.lstrip("@").lower()
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, username FROM users WHERE LOWER(username) = ?", (clean,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            return row[0], f"@{row[1]}", args[1:]
-        else:
-            return None, f"@{clean}", args[1:]
-
-    return message.from_user.id, message.from_user.first_name, args
-
-@dp.message(Command("stats"))
-async def admin_stats(message: types.Message):
-    if not check_admin(message.from_user):
-        await message.answer("❌ <b>Доступ запрещен!</b> Вы не в списке администраторов.", parse_mode="HTML")
-        return
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    tu = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM inventory")
-    tp = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM inventory WHERE is_shiny = 1")
-    ts = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(coins), 0) FROM users")
-    tc = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-
-    await message.answer(
-        f"📊 <b>СТАТИСТИКА СЕРВЕРА (ГЕНЕРАЦИИ 1-3):</b>\n\n"
-        f"👥 Всего тренеров: <b>{tu:,} чел.</b>\n"
-        f"🐾 Поймано монстров: <b>{tp:,} шт.**\n"
-        f"✨ Шайни в мире: <b>{ts:,} шт.</b>\n"
-        f"🪙 Монет в экономике: <b>{tc:,} 🪙</b>\n"
-        f"🌐 Всего видов в игре: <b>386 покемонов</b>",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("give_legendary"))
-async def admin_give_legendary(message: types.Message, command: CommandObject):
-    if not check_admin(message.from_user):
-        await message.answer("❌ Доступ запрещен!", parse_mode="HTML")
-        return
-
-    raw_args = command.args.split() if command.args else []
-    target_id, target_name, _ = resolve_target_user(message, raw_args)
-
-    if not target_id:
-        await message.answer(f"❌ Игрок {target_name} не найден в базе данных бота.", parse_mode="HTML")
-        return
-
-    pid, name = random.choice(POKEMON_DB["Legendary"])
-    cp = generate_cp("Legendary", False)
-    admin_force_save_pokemon(target_id, pid, name, "Legendary", 0, 0, 0, cp)
-    
-    await message.answer(f"👑 <b>Легендарный {html.escape(name)} #{pid:03d} ({cp} CP)</b> выдан игроку <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
-    if target_id != message.from_user.id:
-        try:
-            await message.bot.send_message(target_id, f"🎁 <b>Подарок от Администратора:</b> вам начислен Легендарный <b>{html.escape(name)} #{pid:03d} ({cp} CP)</b>!", parse_mode="HTML")
-        except Exception:
-            pass
-
-@dp.message(Command("give_pokemon"))
-async def admin_give_pokemon(message: types.Message, command: CommandObject):
-    if not check_admin(message.from_user):
-        await message.answer("❌ Доступ запрещен!", parse_mode="HTML")
-        return
-
-    raw_args = command.args.split() if command.args else []
-    if not raw_args and not message.reply_to_message:
-        await message.answer(
-            "💡 <b>Примеры использования:</b>\n"
-            "• <code>/give_pokemon 25</code> — выдать себе Пикачу\n"
-            "• <code>/give_pokemon 384 shiny</code> — выдать себе Шайни Райквазу\n"
-            "• <code>/give_pokemon @username 6</code> — выдать Чаризарда игроку\n"
-            "• <code>/give_pokemon 123456789 150</code> — выдать Мьюту по ID\n"
-            "• Или ответьте на смс игрока: <code>/give_pokemon 25</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    target_id, target_name, p_args = resolve_target_user(message, raw_args)
-
-    if not target_id:
-        await message.answer(f"❌ Игрок {target_name} не найден в базе данных.", parse_mode="HTML")
-        return
-
-    if not p_args:
-        await message.answer("❌ Укажите номер (1-386) или имя покемона.", parse_mode="HTML")
-        return
-
-    is_shiny = 1 if "shiny" in [a.lower() for a in p_args] else 0
-    clean_p_words = [a for a in p_args if a.lower() != "shiny"]
-    p_query = " ".join(clean_p_words).strip().lower()
-
-    if p_query.isdigit():
-        pid = int(p_query)
-    else:
-        pid = ALL_POKEMON_MAP.get(p_query, {}).get("id")
-
-    if not pid or pid < 1 or pid > 386:
-        await message.answer("❌ Покемон с таким номером/именем не найден (диапазон 1–386).", parse_mode="HTML")
-        return
-
-    pinfo = ALL_POKEMON_MAP.get(pid, {"name": "Пикачу", "rarity": "Rare"})
-    cp = generate_cp(pinfo["rarity"], bool(is_shiny))
-    admin_force_save_pokemon(target_id, pid, pinfo["name"], pinfo["rarity"], is_shiny, 0, 0, cp)
-
-    shiny_tag = "✨ ШАЙНИ " if is_shiny else ""
-    await message.answer(f"👑 <b>{shiny_tag}{html.escape(pinfo['name'])} #{pid:03d} ({cp} CP)</b> выдан игроку <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
-    if target_id != message.from_user.id:
-        try:
-            await message.bot.send_message(target_id, f"🎁 <b>Подарок от Администратора:</b> вам выдан {shiny_tag}<b>{html.escape(pinfo['name'])} #{pid:03d} ({cp} CP)</b>!", parse_mode="HTML")
-        except Exception:
-            pass
-
-@dp.message(Command("give_coins"))
-async def admin_give_coins(message: types.Message, command: CommandObject):
-    if not check_admin(message.from_user): return
-    raw_args = command.args.split() if command.args else []
-    if not raw_args:
-        await message.answer("Использование: <code>/give_coins 500</code> или <code>/give_coins @username 500</code>", parse_mode="HTML")
-        return
-    
-    target_id, target_name, c_args = resolve_target_user(message, raw_args)
-    if not target_id or not c_args or not c_args[0].isdigit():
-        await message.answer("❌ Укажите количество монет числом.", parse_mode="HTML")
-        return
-    
-    count = int(c_args[0])
-    change_coins(target_id, count)
-    await message.answer(f"👑 Начислено <b>+{count} 🪙 монет</b> игроку <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
-
-@dp.message(Command("give_items"))
-async def admin_give_items(message: types.Message, command: CommandObject):
-    if not check_admin(message.from_user): return
-    raw_args = command.args.split() if command.args else []
-    count = int(raw_args[0]) if (raw_args and raw_args[0].isdigit()) else 10
-    u = get_user_data(message.from_user.id)
-    update_user(message.from_user.id, lures=u["lures"] + count, ultraballs=u["ultraballs"] + count, candies=u["candies"] + count)
-    await message.answer(f"👑 Начислено по <b>+{count}</b> приманок, ультраболов и конфет!", parse_mode="HTML")
-
-# ================= 7. ЗАПУСК =================
+    if stars == 50:
+        change_coins(uid, 1000)
+        await message.answer("🎉 <b>Оплата Stars прошла успешно!</b> Вам начислено <b>+1 000 🪙 монет</b>!", parse_mode="HTML")
+    elif stars == 150:
+        update_user(uid, egg_type="Legendary", egg_hatch_time=time.time() + 12*3600)
+        await message.answer("🎉 <b>Оплата Stars прошла успешно!</b> 🟡 <b>Легендарное Яйцо</b> помещено в ваш Инкубатор!", parse_mode="HTML")
+
+# ================= 6. ОДНОВРЕМЕННЫЙ ЗАПУСК BOT + API =================
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
     if keep_alive:
         keep_alive()
+
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
-    print("Супер-бот PokéHunter MMO успешно запущен!")
+
+    # Настройка Aiohttp API
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_options("/{tail:.*}", api_options_handler)
+    app.router.add_post("/api/get_user", api_get_user_handler)
+    app.router.add_post("/api/catch", api_catch_handler)
+    app.router.add_post("/api/buy", api_buy_handler)
+    app.router.add_post("/api/create_stars_invoice", lambda req: api_create_stars_invoice(req, bot))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"🚀 Веб-сервер API успешно запущен на порту {PORT}!")
+
+    print("🤖 Бот и API сервер работают одновременно!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
