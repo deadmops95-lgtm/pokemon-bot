@@ -23,36 +23,23 @@ except ImportError:
 
 # ================= 1. КОНФИГУРАЦИЯ И СЕТЬ =================
 BOT_TOKEN = "8838508680:AAHguMr07zwQ7hbSUKjyaNDB7bXd1DTh8b0"
-# Вставьте сюда вашу ссылку на GitHub Pages (или оставьте для авто-кнопки):
+# Вставьте ссылку на ваш GitHub Pages:
 WEBAPP_URL = "https://prokudin95.github.io/pokemon-app/"
 PORT = int(os.environ.get("PORT", 8080))
 
 ADMIN_USERNAMES = ["prokudin95"]
 ADMIN_IDS = set()
 
-def check_admin(user: types.User) -> bool:
-    if not user:
-        return False
-    if user.id in ADMIN_IDS:
+def check_admin(user_id: int, username: str = "") -> bool:
+    if user_id in ADMIN_IDS:
         return True
-    if user.username and user.username.lower().lstrip("@") in [u.lower().lstrip("@") for u in ADMIN_USERNAMES]:
-        ADMIN_IDS.add(user.id)
+    if username and username.lower().lstrip("@") in [u.lower().lstrip("@") for u in ADMIN_USERNAMES]:
+        ADMIN_IDS.add(user_id)
         return True
     return False
 
-# Баланс энергии и цен
 MAX_ENERGY = 100
-ENERGY_RECOVERY_SECONDS = 120  # 1 энергия раз в 2 минуты
-EVOLVE_COST_CANDIES = 3
-EVOLVE_COST_COINS = 150
-
-SHOP_PRICES = {
-    "lure": 15,          # +100 Энергии
-    "ultraball": 25,     # 100% поимка
-    "candies_3": 35,     # 3 Конфеты
-    "egg_rare": 100,     # Редкое яйцо
-    "vip_7d": 250        # VIP 7 дней
-}
+ENERGY_RECOVERY_SECONDS = 120  # +1 энергия каждые 2 минуты
 
 CP_RANGES = {
     "Common": (100, 500),
@@ -62,14 +49,30 @@ CP_RANGES = {
     "Legendary": (3500, 5500)
 }
 
+SHOP_PRICES = {
+    "lure": 15,          # +100 Энергии
+    "ultraball": 25,     # 100% поимка
+    "candies_3": 35,     # 3 Конфеты
+    "egg_rare": 100,     # Редкое яйцо
+    "vip_7d": 250        # VIP 7 дней
+}
+
+DAILY_REWARDS = {
+    1: {"coins": 35, "candies": 1, "lures": 0, "ultraballs": 0, "egg": None},
+    2: {"coins": 50, "candies": 0, "lures": 1, "ultraballs": 0, "egg": None},
+    3: {"coins": 75, "candies": 3, "lures": 0, "ultraballs": 0, "egg": None},
+    4: {"coins": 100, "candies": 0, "lures": 0, "ultraballs": 2, "egg": None},
+    5: {"coins": 130, "candies": 4, "lures": 1, "ultraballs": 0, "egg": None},
+    6: {"coins": 190, "candies": 0, "lures": 0, "ultraballs": 3, "egg": None},
+    7: {"coins": 380, "candies": 6, "lures": 1, "ultraballs": 2, "egg": "Rare"}
+}
+
 # ================= 2. БАЗА 5 ПОКОЛЕНИЙ (649 ПОКЕМОНОВ) =================
 POKEMON_DB = {
     "Legendary": [
-        # Gen 1-3
         (144, "Артикуно", 1), (145, "Запдос", 1), (146, "Молтрес", 1), (150, "Мьюту", 1), (151, "Мью", 1),
         (243, "Райко", 2), (244, "Энтей", 2), (245, "Суикун", 2), (249, "Лугия", 2), (250, "Хо-Ох", 2),
         (382, "Кайогр", 3), (383, "Граудон", 3), (384, "Райкваза", 3), (386, "Деоксис", 3),
-        # Gen 4-5
         (483, "Диалга", 4), (484, "Палкия", 4), (487, "Гиратина", 4), (493, "Аркеус", 4),
         (643, "Реширам", 5), (644, "Зекром", 5), (646, "Кюрем", 5)
     ],
@@ -137,7 +140,7 @@ def generate_cp(rarity: str, is_shiny: bool, is_shadow: bool = False) -> int:
     if is_shadow: cp = int(cp * 1.20)
     return cp
 
-# ================= 3. БАЗА ДАННЫХ SQLITE =================
+# ================= 3. БАЗА ДАННЫХ SQLITE (WAL РЕЖИМ) =================
 def get_db():
     conn = sqlite3.connect("pokemon_bot.db")
     conn.execute("PRAGMA journal_mode = WAL;")
@@ -157,13 +160,16 @@ def init_db():
             last_energy_calc REAL DEFAULT 0,
             lures INTEGER DEFAULT 1,
             ultraballs INTEGER DEFAULT 2,
-            potions INTEGER DEFAULT 3,
             egg_type TEXT DEFAULT NULL,
             egg_hatch_time REAL DEFAULT 0,
+            nursery_p1 INTEGER DEFAULT 0,
+            nursery_p2 INTEGER DEFAULT 0,
+            nursery_end REAL DEFAULT 0,
+            nursery_ready INTEGER DEFAULT 0,
             vip_until REAL DEFAULT 0,
             last_daily REAL DEFAULT 0,
             daily_streak INTEGER DEFAULT 0,
-            referred_by INTEGER DEFAULT 0
+            pvp_rating INTEGER DEFAULT 1000
         );
     """)
     cur.execute("""
@@ -177,7 +183,17 @@ def init_db():
             is_shiny INTEGER DEFAULT 0,
             is_shadow INTEGER DEFAULT 0,
             is_purified INTEGER DEFAULT 0,
-            cp INTEGER DEFAULT 100
+            cp INTEGER DEFAULT 100,
+            in_squad INTEGER DEFAULT 0
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS achievements (
+            user_id INTEGER,
+            achieve_id INTEGER,
+            progress INTEGER DEFAULT 0,
+            claimed INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, achieve_id)
         );
     """)
     cur.execute("""
@@ -190,14 +206,43 @@ def init_db():
             p_name TEXT,
             p_id INTEGER,
             p_cp INTEGER,
-            rate_hr INTEGER DEFAULT 10,
+            rate_hr INTEGER DEFAULT 15,
             last_payout REAL DEFAULT 0
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gyms (
+            gym_id INTEGER PRIMARY KEY,
+            name TEXT,
+            element TEXT,
+            champ_id INTEGER DEFAULT 0,
+            champ_name TEXT DEFAULT 'Мастер Лиги',
+            p_name TEXT,
+            p_id INTEGER,
+            p_cp INTEGER,
+            rate_coins INTEGER DEFAULT 40,
+            rate_candies INTEGER DEFAULT 1,
+            last_payout REAL DEFAULT 0
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS market (
+            lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_id INTEGER,
+            seller_name TEXT,
+            pokemon_id INTEGER,
+            pokemon_name TEXT,
+            rarity TEXT,
+            is_shiny INTEGER,
+            is_shadow INTEGER,
+            cp INTEGER,
+            price INTEGER
         );
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inv_uid ON inventory(user_id);")
     conn.commit()
 
-    # Инициализация 7 Башен
+    # 7 Башен Чемпионов
     towers_init = [
         (1, "🥉 Башня Канто", 500, "Геодуд", 74, 550, 15),
         (2, "🥈 Башня Джото", 1200, "Скизор", 212, 1350, 25),
@@ -212,6 +257,21 @@ def init_db():
             INSERT OR IGNORE INTO towers (tower_id, name, req_cp, champ_id, champ_name, p_name, p_id, p_cp, rate_hr, last_payout)
             VALUES (?, ?, ?, 0, 'Страж Лиги', ?, ?, ?, ?, ?)
         """, (tid, tname, req_cp, pname, pid, pcp, rate, time.time()))
+
+    # 5 Стадионов Чемпионов
+    gyms_init = [
+        (1, "🔥 Огненный Стадион", "🔥 Огонь", "Чаризард", 6, 3200, 50, 1),
+        (2, "💧 Водный Стадион", "💧 Вода", "Бластойз", 9, 3150, 50, 1),
+        (3, "🌿 Травяной Стадион", "🌿 Трава", "Венузавр", 3, 3100, 50, 1),
+        (4, "⚡️ Электро-Стадион", "⚡️ Электро", "Райчу", 26, 3000, 50, 1),
+        (5, "🐲 Драконий Стадион", "🐲 Дракон", "Драгонайт", 149, 3800, 80, 2)
+    ]
+    for gid, gname, elem, pname, pid, pcp, r_coin, r_cand in gyms_init:
+        cur.execute("""
+            INSERT OR IGNORE INTO gyms (gym_id, name, element, champ_id, champ_name, p_name, p_id, p_cp, rate_coins, rate_candies, last_payout)
+            VALUES (?, ?, ?, 0, 'Мастер Лиги', ?, ?, ?, ?, ?, ?)
+        """, (gid, gname, elem, pname, pid, pcp, r_coin, r_cand, time.time()))
+
     conn.commit()
     cur.close()
     conn.close()
@@ -228,6 +288,11 @@ def get_user_data(user_id: int, username: str = ""):
             INSERT INTO users (user_id, username, coins, candies, energy, last_energy_calc)
             VALUES (?, ?, 500, 10, 100, ?)
         """, (user_id, username, now))
+        # Стартовый покемон (Пикачу)
+        cur.execute("""
+            INSERT INTO inventory (user_id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp, in_squad)
+            VALUES (?, 25, 'Пикачу', 1, 'Rare', 0, 0, 0, 480, 1)
+        """, (user_id,))
         conn.commit()
         cur.close()
         conn.close()
@@ -236,7 +301,7 @@ def get_user_data(user_id: int, username: str = ""):
     col_names = [desc[0] for desc in cur.description]
     user_dict = dict(zip(col_names, u))
 
-    # Восстановление энергии со временем
+    # Корректный серверный расчёт энергии
     last_calc = user_dict.get("last_energy_calc", now)
     current_energy = user_dict.get("energy", 100)
     if current_energy < MAX_ENERGY:
@@ -277,12 +342,24 @@ def change_candies(user_id: int, delta: int):
     cur.close()
     conn.close()
 
+def track_achievement(user_id: int, achieve_id: int, add_progress: int = 1):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO achievements (user_id, achieve_id, progress, claimed)
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(user_id, achieve_id) DO UPDATE SET progress = progress + ?
+    """, (user_id, achieve_id, add_progress, add_progress))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def save_pokemon(user_id: int, pid: int, name: str, gen: int, rarity: str, shiny: int, shadow: int, purified: int, cp: int):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO inventory (user_id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO inventory (user_id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp, in_squad)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     """, (user_id, pid, name, gen, rarity, shiny, shadow, purified, cp))
     conn.commit()
     cur.close()
@@ -291,7 +368,7 @@ def save_pokemon(user_id: int, pid: int, name: str, gen: int, rarity: str, shiny
 def get_inventory(user_id: int):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp FROM inventory WHERE user_id = ? ORDER BY cp DESC", (user_id,))
+    cur.execute("SELECT id, pokemon_id, pokemon_name, gen, rarity, is_shiny, is_shadow, is_purified, cp, in_squad FROM inventory WHERE user_id = ? ORDER BY cp DESC", (user_id,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -322,17 +399,46 @@ async def api_get_user_handler(request):
 
         u = get_user_data(uid, username)
         inv = get_inventory(uid)
+        is_adm = check_admin(uid, username)
 
         pokes_list = []
         for r in inv:
             pokes_list.append({
                 "inv_id": r[0], "id": r[1], "name": r[2], "gen": r[3],
-                "rarity": r[4], "is_shiny": bool(r[5]), "is_shadow": bool(r[6]),
-                "type": POKEMON_TYPES.get(r[1], "⚪️ Обычный"), "cp": r[8]
+                "rarity": r[4], "is_shiny": bool(r[5]), "is_shadow": bool(r[6]), "is_purified": bool(r[7]),
+                "type": POKEMON_TYPES.get(r[1], "⚪️ Обычный"), "cp": r[8], "in_squad": bool(r[9])
             })
+
+        # Достижения
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT achieve_id, progress, claimed FROM achievements WHERE user_id = ?", (uid,))
+        ach_rows = cur.fetchall()
+        ach_map = {r[0]: {"progress": r[1], "claimed": bool(r[2])} for r in ach_rows}
+
+        # Башни
+        cur.execute("SELECT tower_id, name, req_cp, champ_name, p_name, p_id, p_cp, rate_hr FROM towers ORDER BY tower_id ASC")
+        t_rows = cur.fetchall()
+        towers = [{"id": r[0], "name": r[1], "req_cp": r[2], "champ": r[3], "p_name": r[4], "p_id": r[5], "p_cp": r[6], "rate": r[7]} for r in t_rows]
+
+        # Стадионы
+        cur.execute("SELECT gym_id, name, element, champ_name, p_name, p_id, p_cp, rate_coins, rate_candies FROM gyms ORDER BY gym_id ASC")
+        g_rows = cur.fetchall()
+        gyms = [{"id": r[0], "name": r[1], "element": r[2], "champ": r[3], "p_name": r[4], "p_id": r[5], "p_cp": r[6], "rate_coins": r[7], "rate_candies": r[8]} for r in g_rows]
+
+        # Рынок
+        cur.execute("SELECT lot_id, seller_id, seller_name, pokemon_id, pokemon_name, rarity, is_shiny, cp, price FROM market ORDER BY lot_id DESC LIMIT 15")
+        m_rows = cur.fetchall()
+        market = [{"lot_id": r[0], "seller_id": r[1], "seller": r[2], "p_id": r[3], "p_name": r[4], "rarity": r[5], "shiny": bool(r[6]), "cp": r[7], "price": r[8]} for r in m_rows]
+        cur.close()
+        conn.close()
+
+        now = time.time()
+        egg_ready = u.get("egg_hatch_time", 0) > 0 and now >= u.get("egg_hatch_time", 0)
 
         return web.json_response({
             "status": "ok",
+            "is_admin": is_adm,
             "user": {
                 "id": u["user_id"],
                 "username": u["username"],
@@ -341,11 +447,18 @@ async def api_get_user_handler(request):
                 "energy": u["energy"],
                 "lures": u["lures"],
                 "ultraballs": u["ultraballs"],
-                "vip": time.time() < u.get("vip_until", 0),
+                "vip": now < u.get("vip_until", 0),
                 "egg_type": u.get("egg_type"),
-                "egg_hatch_time": u.get("egg_hatch_time", 0)
+                "egg_ready": egg_ready,
+                "egg_left": max(0, int(u.get("egg_hatch_time", 0) - now)),
+                "daily_streak": u["daily_streak"],
+                "daily_can_claim": (now - u["last_daily"]) >= 86400
             },
-            "pokedex": pokes_list
+            "pokedex": pokes_list,
+            "achievements": ach_map,
+            "towers": towers,
+            "gyms": gyms,
+            "market": market
         })
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -355,6 +468,7 @@ async def api_catch_handler(request):
         data = await request.json()
         uid = int(data.get("user_id", 0))
         ball_type = data.get("ball_type", "poke")
+        biome = data.get("biome", "forest")
         
         u = get_user_data(uid)
         if u["energy"] < 20:
@@ -362,23 +476,34 @@ async def api_catch_handler(request):
 
         update_user(uid, energy=u["energy"] - 20, last_energy_calc=time.time())
 
-        # Определение редкости
+        # Засада Команды R (12%)
+        is_rocket = random.random() < 0.12
+        if is_rocket:
+            pid, name, gen = random.choice(POKEMON_DB["Rare"])
+            cp = random.randint(1200, 2400)
+            return web.json_response({
+                "status": "rocket_ambush",
+                "enemy": {"id": pid, "name": f"Теневой {name}", "gen": gen, "rarity": "Rare", "is_shadow": True, "cp": cp, "type": POKEMON_TYPES.get(pid, "⚪️")}
+            })
+
         is_ultra = ball_type == "ultra" and u["ultraballs"] > 0
         if is_ultra:
             update_user(uid, ultraballs=u["ultraballs"] - 1)
 
         roll = random.randint(1, 100)
-        rarity = ("Rare" if roll <= 60 else "Epic" if roll <= 92 else "Legendary") if is_ultra else ("Common" if roll <= 65 else "Uncommon" if roll <= 88 else "Rare")
+        rarity = ("Rare" if roll <= 50 else "Epic" if roll <= 90 else "Legendary") if is_ultra else ("Common" if roll <= 60 else "Uncommon" if roll <= 85 else "Rare")
         
         candidates = POKEMON_DB.get(rarity, POKEMON_DB["Common"])
-        p_tuple = random.choice(candidates)
-        pid, name, gen = p_tuple[0], p_tuple[1], p_tuple[2]
+        pid, name, gen = random.choice(candidates)
         
-        shiny = 1 if random.random() < 0.05 else 0
+        shiny = 1 if random.random() < 0.04 else 0
         cp = generate_cp(rarity, bool(shiny))
         
         save_pokemon(uid, pid, name, gen, rarity, shiny, 0, 0, cp)
-        change_coins(uid, 15)
+        change_coins(uid, 20)
+        track_achievement(uid, 1, 1)
+        track_achievement(uid, 2, 1)
+        if shiny: track_achievement(uid, 6, 1)
 
         return web.json_response({
             "status": "success",
@@ -390,33 +515,162 @@ async def api_catch_handler(request):
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-async def api_buy_handler(request):
+async def api_evolve_handler(request):
     try:
         data = await request.json()
         uid = int(data.get("user_id", 0))
-        item = data.get("item", "")
-        cost = SHOP_PRICES.get(item, 999999)
+        inv_id = int(data.get("inv_id", 0))
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT pokemon_id, is_shiny, is_shadow FROM inventory WHERE id = ? AND user_id = ?", (inv_id, uid))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return web.json_response({"status": "error", "message": "Покемон не найден!"})
+
+        old_pid, shiny, shadow = row[0], row[1], row[2]
+        if old_pid not in EVOLUTIONS:
+            cur.close()
+            conn.close()
+            return web.json_response({"status": "error", "message": "Этот покемон достиг финальной формы!"})
+
+        next_pid = EVOLUTIONS[old_pid]
+        next_info = ALL_POKEMON_MAP.get(next_pid, {"name": "Эволюция", "rarity": "Epic", "gen": 1})
 
         u = get_user_data(uid)
-        if u["coins"] < cost:
-            return web.json_response({"status": "error", "message": "Недостаточно монет!"})
+        if u["candies"] < 3 or u["coins"] < 150:
+            cur.close()
+            conn.close()
+            return web.json_response({"status": "error", "message": "Нужно: 3 🍬 и 150 🪙!"})
 
-        change_coins(uid, -cost)
+        new_cp = generate_cp(next_info["rarity"], bool(shiny), bool(shadow)) + 400
+        cur.execute("""
+            UPDATE inventory 
+            SET pokemon_id = ?, pokemon_name = ?, gen = ?, rarity = ?, cp = ?
+            WHERE id = ? AND user_id = ?
+        """, (next_pid, next_info["name"], next_info["gen"], next_info["rarity"], new_cp, inv_id, uid))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        change_candies(uid, -3)
+        change_coins(uid, -150)
+        track_achievement(uid, 11, 1)
+
+        return web.json_response({
+            "status": "success",
+            "pokemon": {"id": next_pid, "name": next_info["name"], "cp": new_cp, "rarity": next_info["rarity"]}
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def api_hatch_egg_handler(request):
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        u = get_user_data(uid)
+        
         now = time.time()
+        if not u.get("egg_type") or now < u.get("egg_hatch_time", 0):
+            return web.json_response({"status": "error", "message": "Яйцо еще не созрело!"})
 
-        if item == "lure":
-            update_user(uid, energy=100, lures=u["lures"] + 1)
-        elif item == "ultraball":
-            update_user(uid, ultraballs=u["ultraballs"] + 1)
-        elif item == "candies_3":
+        egg_t = u["egg_type"]
+        rarity = "Legendary" if egg_t == "Legendary" else ("Rare" if egg_t == "Rare" else "Uncommon")
+        pid, name, gen = random.choice(POKEMON_DB[rarity])
+        shiny = 1 if random.random() < 0.08 else 0
+        cp = generate_cp(rarity, bool(shiny))
+
+        save_pokemon(uid, pid, name, gen, rarity, shiny, 0, 0, cp)
+        update_user(uid, egg_type=None, egg_hatch_time=0)
+        track_achievement(uid, 20, 1)
+
+        return web.json_response({
+            "status": "success",
+            "pokemon": {"id": pid, "name": name, "gen": gen, "rarity": rarity, "is_shiny": bool(shiny), "cp": cp}
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def api_spin_wheel_handler(request):
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        u = get_user_data(uid)
+        
+        roll = random.randint(1, 100)
+        if roll <= 40:
+            change_coins(uid, 50)
+            res = {"type": "coins", "val": 50, "text": "+50 🪙 Монет"}
+        elif roll <= 75:
             change_candies(uid, 3)
-        elif item == "egg_rare":
-            update_user(uid, egg_type="Rare", egg_hatch_time=now + 5*3600)
-        elif item == "vip_7d":
-            cur_vip = max(now, u.get("vip_until", 0))
-            update_user(uid, vip_until=cur_vip + 7*86400)
+            res = {"type": "candies", "val": 3, "text": "+3 🍬 Конфеты"}
+        elif roll <= 92:
+            update_user(uid, lures=u["lures"] + 1)
+            res = {"type": "lure", "val": 1, "text": "+1 🍖 Приманка"}
+        else:
+            pid, name, gen = random.choice(POKEMON_DB["Epic"])
+            cp = generate_cp("Epic", False)
+            save_pokemon(uid, pid, name, gen, "Epic", 0, 0, 0, cp)
+            res = {"type": "pokemon", "val": name, "text": f"🟣 {name} ({cp} CP)!"}
 
-        return web.json_response({"status": "success", "coins": u["coins"] - cost})
+        track_achievement(uid, 25, 1)
+        return web.json_response({"status": "success", "reward": res})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+async def api_claim_achievement_handler(request):
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id", 0))
+        aid = int(data.get("achieve_id", 0))
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT progress, claimed FROM achievements WHERE user_id = ? AND achieve_id = ?", (uid, aid))
+        row = cur.fetchone()
+        if not row or row[1] == 1:
+            cur.close()
+            conn.close()
+            return web.json_response({"status": "error", "message": "Награда уже получена!"})
+
+        cur.execute("UPDATE achievements SET claimed = 1 WHERE user_id = ? AND achieve_id = ?", (uid, aid))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        change_coins(uid, 150)
+        change_candies(uid, 3)
+
+        return web.json_response({"status": "success", "message": "+150 🪙 и +3 🍬 начислены!"})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# ================= 5. АДМИН API И STARS =================
+async def api_admin_give_handler(request):
+    try:
+        data = await request.json()
+        admin_id = int(data.get("admin_id", 0))
+        if not check_admin(admin_id):
+            return web.json_response({"status": "error", "message": "Доступ запрещен!"}, status=403)
+
+        target_id = int(data.get("target_id", admin_id))
+        item_type = data.get("type", "")
+
+        if item_type == "coins":
+            amt = int(data.get("amount", 1000))
+            change_coins(target_id, amt)
+        elif item_type == "pokemon":
+            pid = int(data.get("pokemon_id", 25))
+            shiny = 1 if data.get("shiny") else 0
+            pinfo = ALL_POKEMON_MAP.get(pid, {"name": "Пикачу", "rarity": "Rare", "gen": 1})
+            cp = int(data.get("cp", 3500))
+            save_pokemon(target_id, pid, pinfo["name"], pinfo["gen"], pinfo["rarity"], shiny, 0, 0, cp)
+        elif item_type == "egg":
+            update_user(target_id, egg_type="Legendary", egg_hatch_time=time.time() + 10)
+
+        return web.json_response({"status": "success", "message": "Успешно выдано!"})
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
@@ -427,7 +681,6 @@ async def api_create_stars_invoice(request, bot: Bot):
         stars_amount = int(data.get("stars", 50))
         title = data.get("title", "1 000 Монет")
 
-        # Создаем официальную ссылку оплаты Telegram Stars (XTR)
         link = await bot.create_invoice_link(
             title=f"Покупка: {title}",
             description=f"Начисление товаров в PokéHunter MMO для ID {uid}",
@@ -439,43 +692,27 @@ async def api_create_stars_invoice(request, bot: Bot):
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-# ================= 5. TELEGRAM БОТ ХЕНДЛЕРЫ =================
+# ================= 6. ЗАПУСК БОТА И ВЕБ-СЕРВЕРА =================
 dp = Dispatcher()
-
-async def setup_bot_commands(bot: Bot):
-    cmds = [
-        BotCommand(command="start", description="🎮 Запустить Mini App"),
-        BotCommand(command="profile", description="👤 Мой профиль"),
-        BotCommand(command="pokedex", description="🎒 Покедекс"),
-        BotCommand(command="shop", description="🏪 Магазин"),
-        BotCommand(command="id", description="🆔 Мой ID")
-    ]
-    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     get_user_data(message.from_user.id, message.from_user.username or "")
     
-    # Кнопка открытия Mini App прямо в сообщении
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🎮 Открыть PokéHunter App 3.0", web_app=WebAppInfo(url=WEBAPP_URL)))
+    builder.row(InlineKeyboardButton(text="🎮 Открыть PokéHunter MMO 3.0", web_app=WebAppInfo(url=WEBAPP_URL)))
 
     await message.answer(
         f"👋 <b>Добро пожаловать в PokéHunter MMO 3.0!</b>\n\n"
-        f"• 🌐 <b>5 Поколений</b> (649 покемонов)\n"
-        f"• ⚡️ <b>Шкала энергии</b> и охота без задержек\n"
-        f"• 🏰 <b>7 Башен Чемпионов</b> с доходом\n"
-        f"• 🏆 <b>30 Достижений</b> и Магазин Звёзд\n\n"
-        f"Нажмите кнопку ниже, чтобы запустить графическое приложение!",
+        f"• 🎒 <b>Моя коллекция</b> и Покедекс (1–5 поколения)\n"
+        f"• ⚔️ <b>Анимированная Арена</b>, 7 Башен и 5 Стадионов Лиги\n"
+        f"• 🥚 <b>Инкубатор с анимацией</b> и Питомник\n"
+        f"• 🎰 <b>Рулетка, Викторина</b> и 30 Достижений\n\n"
+        f"Нажмите кнопку ниже для запуска игры:",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
 
-@dp.message(Command("id"))
-async def cmd_id(message: types.Message):
-    await message.answer(f"🆔 Ваш Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
-
-# Оплата Telegram Stars
 @dp.pre_checkout_query()
 async def process_pre_checkout(query: PreCheckoutQuery):
     await query.answer(ok=True)
@@ -485,15 +722,13 @@ async def process_successful_payment(message: types.Message):
     pay = message.successful_payment
     uid = message.from_user.id
     stars = pay.total_amount
-    
     if stars == 50:
         change_coins(uid, 1000)
         await message.answer("🎉 <b>Оплата Stars прошла успешно!</b> Вам начислено <b>+1 000 🪙 монет</b>!", parse_mode="HTML")
     elif stars == 150:
-        update_user(uid, egg_type="Legendary", egg_hatch_time=time.time() + 12*3600)
-        await message.answer("🎉 <b>Оплата Stars прошла успешно!</b> 🟡 <b>Легендарное Яйцо</b> помещено в ваш Инкубатор!", parse_mode="HTML")
+        update_user(uid, egg_type="Legendary", egg_hatch_time=time.time() + 10)
+        await message.answer("🎉 <b>Оплата Stars прошла успешно!</b> 🟡 <b>Легендарное Яйцо</b> созрело в вашем Инкубаторе!", parse_mode="HTML")
 
-# ================= 6. ОДНОВРЕМЕННЫЙ ЗАПУСК BOT + API =================
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
@@ -501,23 +736,25 @@ async def main():
         keep_alive()
 
     bot = Bot(token=BOT_TOKEN)
-    await setup_bot_commands(bot)
 
-    # Настройка Aiohttp API
+    # Веб-сервер API
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_options("/{tail:.*}", api_options_handler)
     app.router.add_post("/api/get_user", api_get_user_handler)
     app.router.add_post("/api/catch", api_catch_handler)
-    app.router.add_post("/api/buy", api_buy_handler)
+    app.router.add_post("/api/evolve", api_evolve_handler)
+    app.router.add_post("/api/hatch", api_hatch_egg_handler)
+    app.router.add_post("/api/spin", api_spin_wheel_handler)
+    app.router.add_post("/api/claim_achieve", api_claim_achievement_handler)
+    app.router.add_post("/api/admin_give", api_admin_give_handler)
     app.router.add_post("/api/create_stars_invoice", lambda req: api_create_stars_invoice(req, bot))
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info(f"🚀 Веб-сервер API успешно запущен на порту {PORT}!")
+    logging.info(f"🚀 Веб-сервер API запущен на порту {PORT}!")
 
-    print("🤖 Бот и API сервер работают одновременно!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
